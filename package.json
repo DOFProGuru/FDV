@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview --port 4173",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types tools/numerics.test.ts",
+    "verify": "node --experimental-strip-types sample/verify.mjs f17-nominal f31-twostage f52-tumble",
+    "smoke": "node tools/smoke.mjs"
   },
   "devDependencies": {
     "@types/three": "^0.186.0",

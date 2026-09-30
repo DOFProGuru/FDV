@@ -172,18 +172,52 @@ Things the manuals do **not** pin down, stated so they can be corrected against 
 
 ## Reconstruction pipeline
 
-`parse → decimate → time-align → register → fuse → events`
+`parse → pad → time-align → register → noise → fuse → events`, all of it in `src/lib/fusion.ts`.
 
-1. **Time-align** — coarse clock offset from cross-correlation of `|vel_up|`; residual per-axis
-   offset from registration.
-2. **Register** — weighted orthogonal Procrustes (rotation + translation, Huber IRLS) fits the
-   Blue-Raven inertial frame onto the GPS frame. Handles rail azimuth/tilt misalignment that a
-   simple offset cannot.
-3. **Fuse** — error-state Kalman filter + RTS smoother, solved independently per axis:
-   state `[δp, δv, δb]`, Blue-Raven velocity as the control input (its *shape* at 50 Hz),
-   GPS position and velocity as measurements. Process noise on `δb` is raised automatically
-   wherever the manual says the inertial nav becomes untrustworthy — gyro rates near the ±2000 deg/s
-   limit and tilt past 90° (tumbling after chute deployment), where gravity direction is lost and
-   position error diverges. There the filter falls back to GPS.
-4. **Events** — decoded from the FER bitmasks, cross-checked against baro/accel so a lost bit does
-   not hide an ejection.
+1. **Pad** — the launch point is not given in either log. It is taken from the GPS rows logged
+   before the vehicle moved, with the tracker's own static offset against the launch point removed
+   (`derivePad`). Everything downstream is stated relative to it, in East-North-Up.
+2. **Time-align** — the two Blue Raven logs are joined on the shared millisecond counter
+   (`sync.ts`), which is exact to a millisecond where the two overlap and is flagged `aliased` when
+   the counter's own roll period leaves a second candidate offset. GPS against Blue Raven is a
+   cross-correlation of the altitude traces over a ±10 s window, cross-checked against two physical
+   anchors (burnout and apogee) that must agree; the winning score, the runner-up and the anchor
+   disagreement are all reported in the diagnostics panel.
+3. **Register** — the tracker's local tangent plane is put onto the pad's East-North-Up by a
+   Huber-weighted yaw fit to the vertical turns in both tracks (`yawFitWeighted`), which is what a
+   ground-relative inertial frame needs when the rail was not pointing north. Reported as the yaw,
+   its standard error and the horizontal/vertical residuals.
+4. **Noise** — what the filter is told to expect of the GPS, estimated from the residuals of a
+   straight-line fit through successive fixes, rather than assumed. If too few fixes survive, a
+   documented fallback is used and marked `(fallback)` in the panel.
+5. **Fuse** — error-state Kalman filter plus a Rauch-Tung-Striebel smoother, solved independently
+   per axis: state `[δp, δv, δb]`, the Blue Raven velocity as the control input (its *shape* at
+   50 Hz, which is where its value is), and GPS position and velocity as measurements.
+   - A GPS row is a measurement only if it reports a fix, at least four satellites and a dilution
+     below 10. A row the tracker itself does not believe in is worse than no row: it pulls the
+     trajectory toward a position that may be miles out. Rows that fail are counted in the panel.
+   - Process noise on `δb` is raised wherever the inertial solution is known to be bad: gyro rates
+     near the ±2000 deg/s limit (the whole saturation window, widened a second either side) and
+     tilt past 90° *while still climbing* — every airframe turns nose-down at apogee on purpose, so
+     tilt alone says nothing once the altimeter is falling.
+   - The vertical-rate and negative-acceleration register bits latch on first downward motion and
+     stay latched, so they are never consulted as a health signal; only their edges mean anything.
+6. **Events** — decoded from the FER bitmasks where the firmware can be trusted, and from the
+   reconstructed trajectory where it cannot: apogee is the top of the fused track with the barometric
+   register as a cross-check, burnout is the top of the speed trace below apogee, landings come from
+   the altimeter with a sustained standstill as the fallback. A coast in the middle of the speed
+   trace — speed rises, drag takes a few percent of it back off, then it rises higher than the first
+   burn ever got — is reported as a staged motor with two burnouts, because a staged motor whose
+   second stage is weaker than its first would otherwise show as a single one.
+
+## Checking this
+
+| command | what it establishes |
+| --- | --- |
+| `npm test` | the numerics in isolation: eigendecomposition, the Huber fits, clock alignment, the filter and smoother, and the parser encoding rules |
+| `npm run verify -- f17-nominal` | the whole pipeline against the simulator's truth, which the app never reads: apogee, clock offset, position and velocity RMS against truth |
+| `npm run smoke` | the page in a real headless Chrome over the DevTools protocol: WebGL came up, the panels filled in, nothing threw, no NaN reached the DOM |
+
+`sample/verify.mjs` on the three bundled flights currently reconstructs apogee to within 0–2 ft,
+the GPS clock offset to within 12 ms, and the track to 35–105 ft RMS against truth, where the
+inertial solution on its own is 2,400–7,600 ft RMS. That gap is the argument for fusing at all.
