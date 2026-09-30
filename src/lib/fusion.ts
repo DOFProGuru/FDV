@@ -2,6 +2,7 @@ import { enuToGeodetic, geodeticToEnu, headingToEnu, type Pad } from './geo.ts';
 import { ident, matMul, matVec, transpose, symMat3Mul, yawFitWeighted, type Mat3 } from './linalg.ts';
 import { alignByAnchors, boxcar, clean, interp, madScale, median, type Series } from './signal.ts';
 import { ferHas } from './parsers/blueRaven.ts';
+import { shiftHigh, syncAlignment } from './sync.ts';
 import type { BrHighRow, BrLowRow, FlightData, FlightEvents, FlightStats, FusedSample, GpsRow } from './types.ts';
 
 const G0 = 32.174; // ft/s^2
@@ -58,6 +59,8 @@ export interface Reconstruction {
   registration: Registration;
   clock: { gpsOffsetS: number; score: number; runnerUpScore: number; anchorAgreementS: number | null };
   noise: { sigmaPosFt: number; sigmaVelFps: number; estimated: boolean };
+  /** how the two Blue Raven logs were put on one time axis, from the shared sync counter */
+  brSync: { offsetS: number; residualMs: number; aliased: boolean } | null;
   durationS: number;
   warnings: string[];
 }
@@ -576,6 +579,15 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
   const brLow = data.brLow;
   if (!brLow.length) throw new Error('Cannot reconstruct: the Blue Raven low-rate log is empty.');
 
+  // The 500 Hz log is on its own clock, and everything downstream (attitude per epoch, IMU health
+  // windows, peak acceleration) looks it up by the low-rate time axis.
+  const sync = syncAlignment(brLow, data.brHigh ?? []);
+  const brHigh = sync ? shiftHigh(data.brHigh ?? [], sync.offsetS) : data.brHigh;
+  if (sync && Math.abs(sync.offsetS) > 0.02)
+    warnings.push(`Blue Raven high-rate log started ${(-sync.offsetS).toFixed(3)} s from the low-rate log; joined them on the shared sync counter.`);
+  if (sync?.aliased)
+    warnings.push('The two Blue Raven logs start at different moments; the 250 ms sync counter fixes the high-rate log to within a multiple of 250 ms only. Re-export with the record datestamps to close the rest.');
+
   const inertial = inertialTrack(brLow);
   if (inertial.source.startsWith('unusable')) warnings.push('Blue Raven log has no usable navigation output; showing GPS only.');
   const nominal = inertial.track;
@@ -651,9 +663,9 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
   const sigmaVel = Math.max(tuning.sigmaVelMin, Number.isFinite(reg.sigmaVelFps) ? reg.sigmaVelFps * 1.3 : 2);
 
   // --- 3. time-varying trust in the inertial solution -------------------------
-  const useHigh = !!data.brHigh?.length;
+  const useHigh = !!brHigh?.length;
   if (!useHigh && data.gps.length) warnings.push('No high-rate log supplied: gyro-saturation detection is limited to tilt and event flags.');
-  const distrust = distrustSeries(tBr, brLow, useHigh ? data.brHigh : undefined);
+  const distrust = distrustSeries(tBr, brLow, useHigh ? brHigh : undefined);
 
   // --- 4. error-state filter + smoother, one axis at a time -------------------
   const n = tBr.length;
@@ -718,7 +730,7 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
   const gpsOnly: Track = { t: gps.t, p: gps.p, v: gpsVelFilled };
 
   // --- 5. samples -------------------------------------------------------------
-  const hr = data.brHigh;
+  const hr = brHigh;
   let hi = 0;
   const samples: FusedSample[] = fused.t.map((t, i) => {
     if (hr) {
@@ -743,7 +755,7 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
   });
 
   const events = decodeEvents(data, fused, distrust, gps, warnings);
-  const stats = computeStats(fused, events, pad.altFt, data.brHigh);
+  const stats = computeStats(fused, events, pad.altFt, brHigh);
 
   return {
     fused,
@@ -759,6 +771,7 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
     },
     clock: { gpsOffsetS: clock.offset, score: clock.score, runnerUpScore: clock.runnerUpScore, anchorAgreementS: clock.anchorAgreementS },
     noise: { sigmaPosFt: sigmaPos, sigmaVelFps: sigmaVel, estimated: Number.isFinite(reg.sigmaPosFt) },
+    brSync: sync,
     durationS: tBr[n - 1] - tBr[0],
     warnings,
   };

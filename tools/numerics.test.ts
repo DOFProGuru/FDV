@@ -258,5 +258,34 @@ function check(name, ok, detail = '') {
   check('a no-fix GPS row is kept but marked', gr[0].fixType === 0, 'fix 0 retained for gap accounting');
 }
 
+// --- joining the two Blue Raven logs on the sync counter ----------------------
+{
+  const { syncAlignment } = await import('../src/lib/sync.ts');
+  const offset = 0.137; // the high-rate log's own axis reads this much early
+  const low: any[] = [], high: any[] = [];
+  for (let i = 0; i < 5000; i++) {
+    const tau = i * 0.02;
+    low.push({ t: tau, sync: Math.round(tau * 1000) % 250 });
+  }
+  for (let i = 0; i < 50000; i++) {
+    const tau = i * 0.002;
+    high.push({ t: tau - offset, sync: Math.round(tau * 1000) % 250 });
+  }
+  const fit = syncAlignment(low, high);
+  check('sync counter joins the two Blue Raven logs', !!fit && Math.abs(fit.offsetS - offset) <= 0.001,
+    `got ${fit ? fit.offsetS.toFixed(3) : 'null'} s of ${offset} s, residual ${fit ? fit.residualMs.toFixed(2) : '-'} ms`);
+  check('a shared-epoch export aligns to nothing', !!(() => {
+    const same = high.map((r) => ({ ...r, t: r.t + offset }));
+    const f = syncAlignment(low, same);
+    return f && Math.abs(f.offsetS) <= 0.001;
+  })());
+  let s3 = 7;
+  const jitter = () => ((s3 = (s3 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) * 250;
+  check('logs from different flights refuse to align',
+    syncAlignment(low, high.map((r) => ({ ...r, sync: Math.round(jitter()) }))) === null);
+  check('an offset beyond the roll period is reported as ambiguous', !!fit && fit.aliased === true,
+    `axes start ${(-offset).toFixed(3)} s apart`);
+}
+
 console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');
 process.exit(fails ? 1 : 0);
