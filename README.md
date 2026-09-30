@@ -3,8 +3,9 @@
 Rocket flight logs in, one defensible trajectory out — with the uncertainty and the caveats shown
 next to the result rather than filed away.
 
-It reads [Blue Raven](FORMATS.md) flight-computer logs (low-rate and high-rate CSV) and a separate GPS
-tracker log (CSV or NMEA), puts them on one clock and one frame, fuses them, and presents the
+It reads [Blue Raven](FORMATS.md) flight-computer logs - the `@ LOG_LOW` / `@ LOG_HIR` telemetry the
+device actually writes, or the CSV exported from it, low-rate and high-rate - and a separate GPS
+tracker log (CSV or NMEA sentences), puts them on one clock and one frame, fuses them, and presents the
 afterwards: key numbers, four profile charts, a 3-D replay with an attitude marker, an event list, a
 list of everything that went wrong with the logs, and a panel that says how much of it to believe.
 
