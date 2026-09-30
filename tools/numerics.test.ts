@@ -2,9 +2,10 @@
 import { procrustesWeighted, yawFitWeighted, matVec, matMul, transpose, jacobiEigen, ident } from '../src/lib/linalg.ts';
 import { alignByAnchors, alignByCrossCorrelation } from '../src/lib/signal.ts';
 import { AxisFilter } from '../src/lib/fusion.ts';
+import type { QuatEpoch } from '../src/ui/attitude.ts';
 
 let fails = 0;
-function check(name, ok, detail = '') {
+function check(name: string, ok: boolean, detail = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  ' + detail : ''}`);
   if (!ok) fails++;
 }
@@ -290,7 +291,6 @@ function check(name, ok, detail = '') {
 // --- which GPS rows count as measurements ------------------------------------
 {
   const { gpsTrack } = await import('../src/lib/fusion.ts');
-  const { derivePad } = await import('../src/lib/parsers/gps.ts');
   const pad: any = { lat: 40.5, lon: -106.2, altFt: 5000 };
   const row = (o: any) => ({ t: 1, lat: 40.5001, lon: -106.2001, altFt: 5100, hvel: 300, heading: 90, upvel: 20, fixType: 3, sats: 9, ...o });
   const kept = (rows: any[]) => gpsTrack(rows, pad as any).t.length;
@@ -301,28 +301,28 @@ function check(name, ok, detail = '') {
   check('HDOP 12 is not a measurement', kept([row({ hdop: 12 })]) === 0);
   check('HDOP 1.8 is', kept([row({ hdop: 1.8 })]) === 1);
   check('a log with no fix or satellite columns is assumed to be fixing', kept([row({ fixType: NaN, sats: NaN })]) === 1);
-  void derivePad;
 }
 
 // --- which reading of the attitude quaternion a log is using ------------------
 {
   const { resolveAttitude } = await import('../src/ui/attitude.ts');
   const D = Math.PI / 180;
-  const qmul = (a: number[], b: number[]): number[] => [
+  type Quat = [number, number, number, number];
+  const qmul = (a: number[], b: number[]): Quat => [
     a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
     a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
     a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
     a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
   ];
-  const qAxis = (v: number[], thDeg: number): number[] => {
+  const qAxis = (v: number[], thDeg: number): Quat => {
     const s = Math.sin((thDeg * D) / 2) / Math.hypot(v[0], v[1], v[2]);
     return [v[0] * s, v[1] * s, v[2] * s, Math.cos((thDeg * D) / 2)];
   };
 
   const az = 35;
   const low: any[] = [];
-  const readingPointing: any[] = [];
-  const readingBody: any[] = [];
+  const readingPointing: QuatEpoch[] = [];
+  const readingBody: QuatEpoch[] = [];
   for (let i = 0; i <= 400; i++) {
     const t = i * 0.02;
     const tilt = 5 + 120 * (i / 400); // sweeps through vertical, so both signs of up appear
@@ -345,7 +345,10 @@ function check(name, ok, detail = '') {
     a.source === 'body-to-world', `${a.source}, median error ${a.agreementDeg.toFixed(3)} deg`);
   let s4 = 11;
   const rnd = () => ((s4 = (s4 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
-  const junk = resolveAttitude(readingPointing.map((r) => ({ t: r.t, quat: [rnd(), rnd(), rnd(), rnd()] })) as any, low as any);
+  const junk = resolveAttitude(
+    readingPointing.map((r) => ({ t: r.t, quat: [rnd(), rnd(), rnd(), rnd()] as Quat })),
+    low as any,
+  );
   check('a quaternion that reproduces neither falls back to tilt plus track', junk.source === 'tilt-track', junk.source);
 
   const straightUp = resolveAttitude(
@@ -380,6 +383,72 @@ function check(name, ok, detail = '') {
   check('episode ends where the saturation stopped', Math.abs(sat.episodes[0].t1 - 0.5) < 1e-9);
   const split = saturationEpisodes([0, 0.002, 1, 1.002], 0.1, 0);
   check('a one second gap splits rather than stretches', split.episodes.length === 2);
+}
+
+// --- degraded inputs, end to end ---------------------------------------------
+{
+  const { reconstruct, derivePad } = await import('../src/lib/fusion.ts');
+  const { parseBlueRaven } = await import('../src/lib/parsers/blueRaven.ts');
+  const { parseGps } = await import('../src/lib/parsers/gps.ts');
+  const { readFileSync } = await import('node:fs');
+  const read = (f: string) => readFileSync(new URL(`../public/data/${f}`, import.meta.url), 'utf8');
+  const low = parseBlueRaven(read('f52-tumble_blue_raven_low.csv'));
+  const high = parseBlueRaven(read('f52-tumble_blue_raven_high.csv'));
+  const gpsP = parseGps(read('f52-tumble_gps.csv'));
+  const gps = gpsP.rows;
+  const pad = derivePad(gps, low.low).pad;
+  const meta = { brDialect: low.dialect, gpsDialect: gpsP.dialect, warnings: [...low.warnings, ...gpsP.warnings] };
+  type Data = Parameters<typeof reconstruct>[0];
+  type Rec = ReturnType<typeof reconstruct>;
+  const full = reconstruct({ brLow: low.low, brHigh: high.high, gps, pad, meta });
+  check('the full log reconstructs apogee', Math.abs(full.stats.maxAltFt - 9226) < 40, full.stats.maxAltFt.toFixed(0));
+
+  const attempt = (label: string, data: Data, want: (r: Rec) => boolean, detail: (r: Rec) => string) => {
+    try {
+      const r = reconstruct(data);
+      check(label, want(r), detail(r));
+    } catch (e) {
+      check(label, false, `threw ${e}`);
+    }
+  };
+
+  attempt(
+    "a flight whose high-rate log was never downloaded still reconstructs",
+    { brLow: low.low, brHigh: undefined, gps, pad, meta },
+    (r) => Math.abs(r.stats.maxAltFt - full.stats.maxAltFt) < 200,
+    (r) => `apogee ${r.stats.maxAltFt.toFixed(0)} ft against ${full.stats.maxAltFt.toFixed(0)} ft, ${r.warnings.length} warnings`,
+  );
+
+  attempt(
+    'a high-rate log with no rows in it does not stop it',
+    { brLow: low.low, brHigh: [], gps, pad, meta },
+    (r) => Number.isFinite(r.stats.maxAltFt) && r.stats.maxVelFps > 100,
+    (r) => `apogee ${r.stats.maxAltFt.toFixed(0)} ft, max ${r.stats.maxVelFps.toFixed(0)} ft/s`,
+  );
+
+  attempt(
+    'a GPS log with no fixes in it still reports a flight, on the IMU alone',
+    { brLow: low.low, brHigh: high.high, gps: [], pad, meta },
+    (r) => Number.isFinite(r.stats.maxAltFt) && r.fused.t.length > 1000,
+    (r) => `${r.fused.t.length} epochs, apogee ${r.stats.maxAltFt.toFixed(0)} ft`,
+  );
+
+  let refused = false,
+    why = '';
+  for (const data of [
+    { brLow: [], brHigh: high.high, gps, pad, meta },
+    { brLow: [], brHigh: undefined, gps: [], pad, meta },
+  ]) {
+    try {
+      reconstruct(data);
+      why = 'returned a result instead of refusing';
+    } catch (e) {
+      refused = e instanceof Error && /low-rate log is empty/i.test(e.message);
+      why = String(e).replace(/^Error: /, '');
+    }
+    if (!refused) break;
+  }
+  check('no flight-computer log is refused by name rather than by a crash', refused, why);
 }
 
 console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');

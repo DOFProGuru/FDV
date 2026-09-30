@@ -59,7 +59,7 @@ apogee within 0–2 ft and the track within 35–105 ft RMS, where the inertial 
 | `npm test` | the numerics on their own: eigendecomposition, the Huber fits, clock alignment, filter and smoother, parser encodings, the quaternion-reading detector |
 | `npm run verify` | the whole pipeline against `sample/truth/`, per flight |
 | `npm run smoke` | the page in a real headless Chrome: WebGL up, panels filled, nothing thrown, no NaN in the DOM (needs `npm run build && npm run preview` first) |
-| `npm run check` | types |
+| `npm run check` | types, over the app and the tools alike |
 
 ## Layout
 

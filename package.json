@@ -13,6 +13,7 @@
     "smoke": "node tools/smoke.mjs"
   },
   "devDependencies": {
+    "@types/node": "^26.6.3",
     "@types/three": "^0.186.0",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
