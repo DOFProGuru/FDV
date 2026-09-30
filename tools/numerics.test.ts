@@ -287,5 +287,100 @@ function check(name, ok, detail = '') {
     `axes start ${(-offset).toFixed(3)} s apart`);
 }
 
+// --- which GPS rows count as measurements ------------------------------------
+{
+  const { gpsTrack } = await import('../src/lib/fusion.ts');
+  const { derivePad } = await import('../src/lib/parsers/gps.ts');
+  const pad: any = { lat: 40.5, lon: -106.2, altFt: 5000 };
+  const row = (o: any) => ({ t: 1, lat: 40.5001, lon: -106.2001, altFt: 5100, hvel: 300, heading: 90, upvel: 20, fixType: 3, sats: 9, ...o });
+  const kept = (rows: any[]) => gpsTrack(rows, pad as any).t.length;
+  check('a clean fix is a measurement', kept([row({})]) === 1);
+  check('a row with no fix is not', kept([row({ fixType: 0 })]) === 0);
+  check('three satellites is not a measurement', kept([row({ sats: 3 })]) === 0, 'four is the least that fixes a position');
+  check('four satellites is', kept([row({ sats: 4 })]) === 1);
+  check('HDOP 12 is not a measurement', kept([row({ hdop: 12 })]) === 0);
+  check('HDOP 1.8 is', kept([row({ hdop: 1.8 })]) === 1);
+  check('a log with no fix or satellite columns is assumed to be fixing', kept([row({ fixType: NaN, sats: NaN })]) === 1);
+  void derivePad;
+}
+
+// --- which reading of the attitude quaternion a log is using ------------------
+{
+  const { resolveAttitude } = await import('../src/ui/attitude.ts');
+  const D = Math.PI / 180;
+  const qmul = (a: number[], b: number[]): number[] => [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ];
+  const qAxis = (v: number[], thDeg: number): number[] => {
+    const s = Math.sin((thDeg * D) / 2) / Math.hypot(v[0], v[1], v[2]);
+    return [v[0] * s, v[1] * s, v[2] * s, Math.cos((thDeg * D) / 2)];
+  };
+
+  const az = 35;
+  const low: any[] = [];
+  const readingPointing: any[] = [];
+  const readingBody: any[] = [];
+  for (let i = 0; i <= 400; i++) {
+    const t = i * 0.02;
+    const tilt = 5 + 120 * (i / 400); // sweeps through vertical, so both signs of up appear
+    const roll = 200 * t; // fast enough that the half-angle sign flips many times
+    low.push({ t, tilt, roll });
+    const point = [Math.sin(tilt * D) * Math.cos(az * D), Math.sin(tilt * D) * Math.sin(az * D), Math.cos(tilt * D)];
+    // reading B: the quaternion is a roll about the pointing direction, so its vector part is it
+    readingPointing.push({ t, quat: qAxis(point, roll) });
+    // reading A: rotating body +z by the quaternion gives the pointing direction, and the roll is a
+    // rotation about body +z, which leaves that direction alone
+    const hinge = [-Math.sin(az * D), Math.cos(az * D), 0];
+    readingBody.push({ t, quat: qmul(qAxis(hinge, tilt), qAxis([0, 0, 1], roll)) });
+  }
+
+  const b = resolveAttitude(readingPointing as any, low as any);
+  check('the pointing-vector reading is chosen when it is the one that reproduces the tilt',
+    b.source === 'axis-is-pointing', `${b.source}, median error ${b.agreementDeg.toFixed(3)} deg over ${Math.round(b.withinTol * 100)}% of epochs`);
+  const a = resolveAttitude(readingBody as any, low as any);
+  check('the body-to-world reading is chosen when it is the one that reproduces the tilt',
+    a.source === 'body-to-world', `${a.source}, median error ${a.agreementDeg.toFixed(3)} deg`);
+  let s4 = 11;
+  const rnd = () => ((s4 = (s4 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const junk = resolveAttitude(readingPointing.map((r) => ({ t: r.t, quat: [rnd(), rnd(), rnd(), rnd()] })) as any, low as any);
+  check('a quaternion that reproduces neither falls back to tilt plus track', junk.source === 'tilt-track', junk.source);
+
+  const straightUp = resolveAttitude(
+    low.map((r) => ({ t: r.t, quat: qAxis([0, 0, 1], r.roll) })),
+    low.map((r) => ({ ...r, tilt: 0 })),
+  );
+  check('a rocket flying straight up cannot tell the two readings apart, so neither is claimed',
+    straightUp.source === 'tilt-track', straightUp.source);
+
+  // Past 90 degrees of tilt the nose is below the horizon. The half-angle in the quaternion loses
+  // that sign, so it has to come back from the reported tilt, whichever way the roll has spun it.
+  const up = b.at(1.0, { e: 1, n: 0 });
+  const down = b.at(7.0, { e: 1, n: 0 });
+  check('the marker is nose-up while the reported tilt is under 90 degrees', !!up && up.axis[2] > 0.9, `up component ${up ? up.axis[2].toFixed(2) : 'none'}`);
+  check('and nose-down once the reported tilt is over 90 degrees', !!down && down.axis[2] < -0.3, `up component ${down ? down.axis[2].toFixed(2) : 'none'}`);
+  const rollDeg = down ? (((down.roll / D) % 360) + 360) % 360 : NaN;
+  check('roll is carried through from the low-rate log', !!down && Math.abs(rollDeg - (1400 % 360)) < 1,
+    `${rollDeg.toFixed(0)} degrees reported, ${(1400 % 360).toFixed(0)} expected`);
+}
+
+// --- gyro saturation episodes ------------------------------------------------
+{
+  const { saturationEpisodes } = await import('../src/lib/fusion.ts');
+  const times = [
+    ...Array.from({ length: 251 }, (_, i) => i * 0.002), // 0 to 0.5 s at 500 Hz: a real tumble
+    5.0, // one dropped field, which is a blip and not an episode
+    ...Array.from({ length: 151 }, (_, i) => 10 + i * 0.002), // 10 to 10.3 s
+  ];
+  const sat = saturationEpisodes(times);
+  check('two saturation episodes', sat.episodes.length === 2, JSON.stringify(sat.episodes));
+  check('one blip counted rather than listed', sat.blips === 1, `${sat.blips}`);
+  check('episode ends where the saturation stopped', Math.abs(sat.episodes[0].t1 - 0.5) < 1e-9);
+  const split = saturationEpisodes([0, 0.002, 1, 1.002], 0.1, 0);
+  check('a one second gap splits rather than stretches', split.episodes.length === 2);
+}
+
 console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');
 process.exit(fails ? 1 : 0);

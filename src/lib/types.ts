@@ -48,6 +48,8 @@ export interface GpsRow {
   upvel: number;
   fixType: number;
   sats: number;
+  /** horizontal dilution of precision, when the log carries it */
+  hdop?: number;
 }
 
 export interface FlightData {

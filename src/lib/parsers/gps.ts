@@ -132,6 +132,7 @@ function parseCsvGps(text: string): { rows: GpsRow[]; flightDate?: string; warni
   const cUpMs = col('upvel_mps', 'vertical_velocity_mps', 'climb_mps');
   const cFix = col('fix_type', 'fix', 'gps_fix', 'position_type');
   const cSats = col('sats_total', 'satellites', 'sats', 'sv_count', 'num_sv', 'sat_count');
+  const cHdop = col('hdop', 'gps_hdop', 'hdop_100', 'dop');
   if (cLat < 0 || cLon < 0) warnings.push('GPS file: latitude/longitude columns not found.');
 
   const out: GpsRow[] = [];
@@ -167,6 +168,7 @@ function parseCsvGps(text: string): { rows: GpsRow[]; flightDate?: string; warni
       upvel,
       fixType: g(cFix),
       sats: g(cSats),
+      hdop: cHdop >= 0 ? g(cHdop) : undefined,
     });
   }
 

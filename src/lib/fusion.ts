@@ -184,7 +184,14 @@ export function gpsTrack(gps: GpsRow[], pad: Pad): GpsTrack {
   const fix: number[] = [];
   for (const r of gps) {
     if (!finiteAll(r.lat, r.lon)) continue;
-    if (r.fixType === 0) continue; // no fix at all
+    // Not every row is a measurement. A row with no fix, or with too few satellites or too poor a
+    // dilution to place the vehicle within the few hundred feet the fusion is working to, is worse
+    // than no measurement at all: the filter would pull the trajectory toward a position the
+    // tracker itself does not believe in.
+    const fixType = Number.isFinite(r.fixType) ? r.fixType : 3; // a log with no fix column is assumed to be fixing
+    if (fixType < 1) continue;
+    if (Number.isFinite(r.sats) && r.sats >= 1 && r.sats < 4) continue;
+    if (Number.isFinite(r.hdop) && r.hdop! >= 10) continue;
     const [e, n, u] = geodeticToEnu(r.lat, r.lon, Number.isFinite(r.altFt) ? r.altFt : pad.altFt, pad);
     let ve: number, vn: number;
     if (Number.isFinite(r.hvel) && Number.isFinite(r.heading)) {
@@ -200,7 +207,7 @@ export function gpsTrack(gps: GpsRow[], pad: Pad): GpsTrack {
     t.push(r.t);
     p.push(v3(e, n, u));
     v.push(v3(ve, vn, Number.isFinite(r.upvel) ? r.upvel : NaN));
-    fix.push(r.fixType);
+    fix.push(fixType);
   }
   return { t, p, v, fix };
 }
@@ -215,22 +222,47 @@ function headingFromPosition(ts: number[], p: Vec3[]): number {
   return (Math.atan2(de, dn) * 180) / Math.PI;
 }
 
+/** Samples whose logged gyro rate is at the wrapping limit, or is not there at all. */
+function saturatedTimes(brHigh: BrHighRow[]): number[] {
+  const out: number[] = [];
+  for (const h of brHigh) {
+    const g = Math.max(Math.abs(h.gyro[0]), Math.abs(h.gyro[1]), Math.abs(h.gyro[2]));
+    if (g >= GYRO_SAT_DPPS || !h.gyro.every(Number.isFinite)) out.push(h.t);
+  }
+  return out;
+}
+
+/**
+ * Saturated samples merged into episodes. At 500 Hz a real tumble is thousands of consecutive
+ * samples and a dropped field is one or two, so anything shorter than `minS` is not an episode a
+ * reader would write down; `gapS` is the largest gap still treated as the same episode, since the
+ * high-rate log itself has gaps whenever a sample is missing.
+ */
+export function saturationEpisodes(
+  times: number[],
+  gapS = 0.1,
+  minS = 0.1,
+): { episodes: { t0: number; t1: number }[]; blips: number } {
+  const eps: { t0: number; t1: number }[] = [];
+  for (const t of times) {
+    const last = eps[eps.length - 1];
+    if (last && t - last.t1 <= gapS) last.t1 = t;
+    else eps.push({ t0: t, t1: t });
+  }
+  const episodes = eps.filter((e) => e.t1 - e.t0 >= minS);
+  return { episodes, blips: eps.length - episodes.length };
+}
+
 /** Per-sample distrust in 0..1 from high-rate IMU health and attitude. */
 export function distrustSeries(tBr: number[], br: BrLowRow[], brHigh?: BrHighRow[]): number[] {
-  const satT: number[] = [];
-  if (brHigh) {
-    for (const h of brHigh) {
-      const g = Math.max(Math.abs(h.gyro[0]), Math.abs(h.gyro[1]), Math.abs(h.gyro[2]));
-      if (g >= GYRO_SAT_DPPS || !h.gyro.every(Number.isFinite)) satT.push(h.t);
-    }
-  }
+  const satT = brHigh ? saturatedTimes(brHigh) : [];
   const raw = br.map((r, i) => {
     let d = 0;
     const tilt = Math.abs(Number.isFinite(r.tilt) ? r.tilt : 0);
-    // Past 90 degrees of tilt the airframe is tumbling and its own idea of up is worthless - but
-    // only while it is still climbing counts. Every airframe turns nose-down at apogee and then
-    // flies upside down under the drogue on purpose, so tilt alone says nothing once the altimeter
-    // is falling.
+    // Past 90 degrees of tilt the airframe's own idea of up is worthless - but only tilt past
+    // vertical *while it is still climbing* means a tumble. Every airframe turns nose-down at apogee
+    // and then flies upside down under the drogue on purpose, so tilt alone says nothing once the
+    // altimeter is falling.
     const climbing = !Number.isFinite(r.velUp) ? true : r.velUp > 0;
     if (tilt > 90 && climbing) d = Math.max(d, Math.min(1, (tilt - 90) / 40));
     // The vertical-rate and negative-acceleration register bits latch on first downward motion and
@@ -430,7 +462,8 @@ export function derivePad(gps: GpsRow[], brLow: BrLowRow[]): { pad: Pad; notes: 
 }
 
 // --- frame registration ------------------------------------------------------
-interface Registration {
+/** How the GPS tracker's frame was put onto the launch point's East-North-Up. */
+export interface Registration {
   R: Mat3;
   t: [number, number, number];
   rmsFt: number;
@@ -559,7 +592,8 @@ export function register(
 }
 
 // --- reconstruction ----------------------------------------------------------
-function speedOfSoundFps(altFt: number): number {
+/** ISA speed of sound, ft/s. Exported so the UI can label a Mach trace with the same physics. */
+export function speedOfSoundFps(altFt: number): number {
   const hM = Math.max(0, altFt * 0.3048);
   const T = hM < 11000 ? 288.15 - 0.0065 * hM : 216.65; // ISA troposphere / tropopause
   return Math.sqrt(1.4 * 287.05 * T) * 3.28084;
@@ -856,8 +890,30 @@ function decodeEvents(
   // an analyst reading the log would write down.
   let iBurn = iLiftoff;
   for (let i = iLiftoff; i <= iApogee; i++) if (speedArr[i] > speedArr[iBurn]) iBurn = i;
+  // A staged motor leaves a coast in the middle of that trace: the speed climbs, the first stage cuts
+  // out, drag takes some of it back off, and the second stage then takes it higher than the first
+  // ever got. The biggest peak-to-trough drop before the top is that coast; it only counts if it is
+  // worth more than the noise in the track, so a progressive-burn motor with a soft spot does not
+  // invent a second stage.
+  let iPeak = iLiftoff, iCoast = -1, drop = 0;
+  for (let i = iLiftoff; i < iBurn; i++) {
+    if (speedArr[i] > speedArr[iPeak]) iPeak = i;
+    else if (speedArr[iPeak] - speedArr[i] > drop) {
+      drop = speedArr[iPeak] - speedArr[i];
+      iCoast = iPeak;
+    }
+  }
+  const staged = iCoast > iLiftoff && drop > 0.03 * maxV;
+  if (staged)
+    push(t[iCoast], 'burnout', `First burnout ${speedArr[iCoast].toFixed(0)} ft/s; the speed then falls away before rising again, so a second stage lit`);
   if (speedArr[iBurn] > 0.1 * maxV)
-    push(t[iBurn], 'burnout', `Burnout ${speedArr[iBurn].toFixed(0)} ft/s after ${(t[iBurn] - t[iLiftoff]).toFixed(1)} s of powered flight`);
+    push(
+      t[iBurn],
+      'burnout',
+      staged
+        ? `Second burnout ${speedArr[iBurn].toFixed(0)} ft/s, the top of the speed trace`
+        : `Burnout ${speedArr[iBurn].toFixed(0)} ft/s after ${(t[iBurn] - t[iLiftoff]).toFixed(1)} s of powered flight`,
+    );
 
   push(tApogee, 'apogee', `Apogee ${Math.round(fused.p[iApogee].u).toLocaleString()} ft AGL`);
 
@@ -918,6 +974,19 @@ function decodeEvents(
   } else warnings.push('Landing was not detected; the log ends before the airframe came to rest.');
 
   // Anomalies the registers do not report.
+  if (data.brHigh) {
+    const sat = saturationEpisodes(saturatedTimes(data.brHigh));
+    for (const e of sat.episodes.slice(0, 4))
+      warnings.push(
+        `The logged gyro rate stayed at ${GYRO_SAT_DPPS} deg/s or above (this IMU wraps at roughly +/-2000), or went missing, from T+${e.t0.toFixed(1)} s to T+${e.t1.toFixed(1)} s. Over that interval the airframe's own attitude did not exist and the track is carried by GPS alone.`,
+      );
+    if (sat.episodes.length > 4)
+      warnings.push(`${sat.episodes.length - 4} further saturation episodes are not listed one by one.`);
+    if (sat.blips)
+      warnings.push(
+        `${sat.blips} saturation blip${sat.blips > 1 ? 's' : ''} shorter than 100 ms: one or two samples, counted as distrust but not worth a line of their own.`,
+      );
+  }
   const iSat = data.brHigh ? firstWhere(t, (i) => distrust[i] > 0.6) : -1;
   if (iSat >= 0) {
     const endI = firstWhere(t, (i) => i > iSat && distrust[i] < 0.2, iSat);
