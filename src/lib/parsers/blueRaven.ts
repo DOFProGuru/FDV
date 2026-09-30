@@ -40,6 +40,9 @@ export function looksLikeBlueRaven(text: string): boolean {
 // --- native telemetry --------------------------------------------------------
 const NUM = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
 
+/** Tokens that name the record rather than a field within it. */
+const FRAME_MARKERS = new Set(['@', 'log_low', 'log_hir', 'gps_stat']);
+
 /**
  * Split an `@`-framed record into label -> payload, preserving order.
  *
@@ -55,6 +58,10 @@ function sections(line: string): { order: string[]; byLabel: Map<string, number[
   let cur: number[] | null = null;
   let curRaw: string[] | null = null;
   for (const raw of tokens) {
+    // The frame marker is not a data section. Without this the header numbers (packet length, UTC
+    // datestamp, sync code) would be filed under the marker's own name and `head` would stay empty.
+    const bare = raw.endsWith(':') ? raw.slice(0, -1).toLowerCase() : raw.toLowerCase();
+    if (FRAME_MARKERS.has(bare)) continue;
     if (raw.endsWith(':')) {
       const key = raw.slice(0, -1).toLowerCase();
       if (!byLabel.has(key)) {
@@ -98,12 +105,13 @@ function parseTelemetryLow(text: string): { rows: BrLowRow[]; flightDate?: strin
     if (!isLog) continue;
     const { byLabel, tokens, head } = sections(line);
     if (!flightDate) {
-      const y = head.find((v) => v >= 1990 && v <= 2100);
-      if (y !== undefined) {
-        const yi = head.indexOf(y);
-        const [, mo, d] = head.slice(yi, yi + 6);
-        if (mo !== undefined && d !== undefined) flightDate = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-      }
+      // Positional, per the documented record layout: packet length, then year, month, day, hour,
+      // minute, second. Some firmware writes a two-digit year, which is unambiguous for any device
+      // sold this century; a scan for a four-digit number would instead lock onto whatever field
+      // happens to look like a year.
+      const [y, mo, d] = head.slice(1, 4);
+      if (Number.isFinite(y) && Number.isFinite(mo) && Number.isFinite(d) && mo >= 1 && mo <= 12 && d >= 1 && d <= 31)
+        flightDate = `${y < 100 ? 2000 + y : y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
     }
     const bo = byLabel.get('bo') ?? [];
     const v = byLabel.get('v') ?? [];
@@ -160,7 +168,8 @@ function parseTelemetryHigh(text: string): BrHighRow[] {
   return payload.map((p, i) => {
     const gx = p[1] / 100, gy = p[2] / 100, gz = p[3] / 100;
     const ax = p[4] / 100, ay = p[5] / 100, az = p[6] / 100;
-    // Axis-first, x10000-scaled quaternion: the fourth term is w = cos(theta/2).
+    // Axis-first unit quaternion, carried by some firmware as 30000-scaled integers: the fourth
+    // term is w = cos(theta/2), not an angle.
     const q = normaliseQuat([p[7] / 30000, p[8] / 30000, p[9] / 30000, p.length > 10 ? p[10] / 30000 : NaN]);
     return {
       t: t[i],

@@ -1,6 +1,7 @@
 // Unit checks for the numerics that the reconstruction depends on.
 import { procrustesWeighted, yawFitWeighted, matVec, matMul, transpose, jacobiEigen, ident } from '../src/lib/linalg.ts';
 import { alignByAnchors, alignByCrossCorrelation } from '../src/lib/signal.ts';
+import { AxisFilter } from '../src/lib/fusion.ts';
 
 let fails = 0;
 function check(name, ok, detail = '') {
@@ -112,8 +113,6 @@ function check(name, ok, detail = '') {
     `rms=${fit.rms.toExponential(1)}`);
 }
 
-console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');
-process.exit(fails ? 1 : 0);
 
 // --- error-state filter + RTS smoother ---------------------------------------
 {
@@ -139,16 +138,14 @@ process.exit(fails ? 1 : 0);
   const sigmaP = 56, sigmaV = 3, R = sigmaP ** 2, Rv = sigmaV ** 2;
 
   const f = new AxisFilter(3 * sigmaP, 2 * sigmaV, 1.5);
-  let k = 0;
   for (let i = 0; i < n; i++) {
     if (i > 0) f.predict(dt, 0.35 + Math.max(0, (t[i] - 20) / 160) * 900, 0.004);
     f.xPred.push([...f.x]); f.PPred.push([...f.P]);
-    while (k < t.length && k * dt * 5 <= i) {
-      if (k % 5 === 0) {
-        f.update(0, pTrue[k] + rnd() * sigmaP - pNom[k], R);
-        f.update(1, vTrue[k] + rnd() * sigmaV - vNom[k], Rv);
-      }
-      k++;
+    // Fixes arrive at 10 Hz against a 50 Hz inertial nominal, and are stated relative to that
+    // nominal because the filter estimates the error in it.
+    if (i % 5 === 0) {
+      f.update(0, pTrue[i] + rnd() * sigmaP - pNom[i], R);
+      f.update(1, vTrue[i] + rnd() * sigmaV - vNom[i], Rv);
     }
     f.xUpd.push([...f.x]); f.PUpd.push([...f.P]);
   }
@@ -168,3 +165,98 @@ process.exit(fails ? 1 : 0);
   check('smoothed velocity is bounded too', Math.abs(Math.max(...velFused)) < Math.max(...vTrue.map(Math.abs)) * 3,
     `max fused vel=${Math.max(...velFused).toExponential(2)} ft/s`);
 }
+
+// --- parser encodings ---------------------------------------------------------
+// The rules that decide how a byte stream becomes numbers: hex registers, engineering units versus
+// the vendor's scaled integers, quaternion form. Each is a coin-flip in a real file, so each needs
+// a fixture that says which way it landed.
+{
+  const { parseBlueRaven, ferHas } = await import('../src/lib/parsers/blueRaven.ts');
+  const { parseGps } = await import('../src/lib/parsers/gps.ts');
+
+  // Hex registers, CSV form. 180 is 0x180 = the pair of bits the pad noise sets, and 3A7 is a
+  // mid-flight register that a numeric scan would truncate to 3.
+  const csvLow = [
+    't_s,sync_code,vel_up_fps,vel_downrange_fps,vel_crossrange_fps,alt_nav_ft,pos_downrange_ft,pos_crossrange_ft,alt_baro_agl_ft,tilt_deg,roll_deg,fer',
+    '-1.000,120,0.0,0.0,0.0,5212,0,0,0.4,1.2,0.0,180',
+    '0.020,140,12.0,0.4,0.1,5212,0,0,0.6,1.4,0.5,0x181',
+    '0.040,160,25.0,0.5,0.2,5213,0,0,0.9,1.5,1.1,3A7',
+    '0.060,180,38.0,0.6,0.3,5214,1,0,1.3,1.6,1.7,180d',
+  ].join('\n');
+  const low = parseBlueRaven(csvLow, 'csv').low;
+  check('CSV FER columns are hexadecimal bitmasks', low.length === 4 && ferHas(low[0].fer, 7) && ferHas(low[0].fer, 8) && !ferHas(low[0].fer, 0),
+    `row0 fer=0x${(low[0].fer >>> 0).toString(16)} (180 hex)`);
+  check('CSV FER with a prefix is hex too', ferHas(low[1].fer, 0) && ferHas(low[1].fer, 8), '0x181');
+  check('CSV FER with letters survives the numeric scan', low[2].fer === 0x3a7, `fer=0x${(low[2].fer >>> 0).toString(16)}`);
+  check('an explicit decimal suffix is honoured', low[3].fer === 180, `fer=${low[3].fer}`);
+
+  // Native telemetry: the header lives between the frame marker and the first label, and the sync
+  // code in it is the only clock, so a mis-parsed header loses both the time axis and the date.
+  const nativeLow = [
+    '@ LOG_LOW: 22 24 3 23 21 23 16 120 Bo: 68.4 50000 V: 8412 0 0 0 0 12 POS: 5212 0 0 VEL: 0 0 0 AGl: 0 Ang: 12 0 0 FER: 180 CRC: 6A1D',
+    '@ LOG_LOW: 22 24 3 23 21 23 16 140 Bo: 68.5 49990 V: 8410 300 0 0 0 40 POS: 5213 1 0 VEL: 12 0 0 AGl: 1 Ang: 14 0 0 FER: 181 CRC: 6A1E',
+    '@ LOG_LOW: 22 24 3 23 21 23 16 160 Bo: 68.6 49980 V: 8409 0 0 0 0 6 POS: 5214 2 0 VEL: 25 1 0 AGl: 2 Ang: 16 1 0 FER: 3A7 CRC: 6A1F',
+  ].join('\n');
+  const tl = parseBlueRaven(nativeLow, 'telemetry');
+  check('native low-rate keeps the record datestamp', tl.flightDate === '2024-03-23', `date=${tl.flightDate}`);
+  check('native low-rate time comes from the sync code', tl.low.length === 3 && Math.abs(tl.low[1].t - 0.020) < 1e-9 && Math.abs(tl.low[2].t - 0.040) < 1e-9,
+    `t=${tl.low.map((r) => r.t.toFixed(3)).join(',')}`);
+  check('native Bo: pressure is 50000 per atmosphere', Math.abs(tl.low[0].baroPressureAtm - 1) < 1e-9,
+    `${tl.low[0].baroPressureAtm}`);
+  check('native Ang: tilt is in tenths of a degree', Math.abs(tl.low[0].tilt - 1.2) < 1e-9, `${tl.low[0].tilt} deg`);
+  check('native FER is hex decoded from the raw token', tl.low[2].fer === 0x3a7, `fer=0x${(tl.low[2].fer >>> 0).toString(16)}`);
+
+  // Native high rate: sync then nine sensor terms then four quaternion terms, all scaled integers.
+  const nativeHigh = [
+    '@ LOG_HIR: 18 24 3 23 21 23 16 120 250 -140 30 20 -10 9950 0 0 30000 0 CRC: 1111',
+    '@ LOG_HIR: 18 24 3 23 21 23 16 122 260 -130 35 25 -12 9940 150 0 29996 400 CRC: 1112',
+  ].join('\n');
+  const th = parseBlueRaven(nativeHigh, 'telemetry').high!;
+  check('native high-rate gyro/accel are hundredths', Math.abs(th[0].gyro[0] - 2.5) < 1e-9 && Math.abs(th[0].accel[2] - 99.5) < 1e-9,
+    `gyroX=${th[0].gyro[0]} accelZ=${th[0].accel[2]}`);
+  check('native high-rate quaternion is a unit quaternion', Math.abs(Math.hypot(...th[1].quat) - 1) < 1e-6,
+    `|q|=${Math.hypot(...th[1].quat).toFixed(6)} w=${th[1].quat[3].toFixed(4)}`);
+  check('native high-rate quaternion keeps the axis-first order', th[1].quat[3] > th[1].quat[0] && Math.abs(th[1].quat[0]) < 0.01,
+    `q=${th[1].quat.map((x) => x.toFixed(3))}`);
+  check('native high-rate time comes from the sync code', Math.abs(th[1].t - 0.002) < 1e-9, `t=${th[1].t}`);
+
+  // High-rate CSV in engineering units must pass through untouched...
+  const engHigh = [
+    't_s,sync_code,gyro_x_dpps,gyro_y_dpps,gyro_z_dpps,accel_x_g,accel_y_g,accel_z_g,quat_x,quat_y,quat_z,quat_w',
+    '-0.002,100,0.40,0.10,-0.20,0.020,0.001,1.019,0.00001,0.00000,0.00000,1.00000',
+    '0.000,102,41.20,-8.30,3.10,27.400,0.900,3.100,0.01000,0.00200,0.00040,0.99995',
+  ].join('\n');
+  const eng = parseBlueRaven(engHigh, 'csv').high!;
+  check('engineering-unit high-rate CSV is passed through', Math.abs(eng[1].accel[0] - 27.4) < 1e-9 && Math.abs(eng[1].gyro[0] - 41.2) < 1e-9,
+    `accelX=${eng[1].accel[0]} gyroX=${eng[1].gyro[0]}`);
+  check('unit-form quaternion columns survive', Math.abs(Math.hypot(...eng[1].quat) - 1) < 1e-6, `|q|=${Math.hypot(...eng[1].quat).toFixed(6)}`);
+
+  // ...and the vendor's centi-unit export must land in the same units.
+  const centiHigh = engHigh
+    .replace('41.20,-8.30,3.10,27.400,0.900,3.100', '4120,-830,310,2740,90,310')
+    .replace('0.40,0.10,-0.20,0.020,0.001,1.019', '40,10,-20,2,0,102')
+    .replace('0.01000,0.00200,0.00040,0.99995', '300,60,12,29998');
+  const cen = parseBlueRaven(centiHigh, 'csv').high!;
+  check('centi-unit high-rate CSV is rescaled to engineering units', Math.abs(cen[1].accel[0] - 27.4) < 1e-6,
+    `accelX=${cen[1].accel[0]}`);
+  check('both high-rate dialects agree on the boost acceleration',
+    Math.abs(cen[1].accel[0] - eng[1].accel[0]) < 0.05 * Math.abs(eng[1].accel[0]),
+    `centi=${cen[1].accel[0].toFixed(2)} eng=${eng[1].accel[0].toFixed(2)} g`);
+  check('30000-scaled quaternion in CSV is divided back down', Math.abs(Math.hypot(...cen[1].quat) - 1) < 1e-3,
+    `|q|=${Math.hypot(...cen[1].quat).toFixed(4)}`);
+
+  // A GPS file's Doppler velocities are the only low-noise rate the app ever gets, so they must
+  // survive parsing; a receiver with no fix must not be read as a fix at (0,0).
+  const gpsCsv = [
+    't_iso,gps_unit,lat_deg,lon_deg,alt_ft,hvel_fps,heading_deg,upvel_fps,fix_type,sats_total',
+    '2026-05-16T15:41:55.500,TRK,34.259071,-106.363103,5182.2,0.4,179.2,-0.9,0,9',
+    '2026-05-16T15:41:55.600,TRK,34.259101,-106.363108,5227.3,1450.2,179.2,1200.6,3,9',
+  ].join('\n');
+  const gr = parseGps(gpsCsv).rows;
+  check('GPS Doppler velocities are parsed', gr.length === 2 && Math.abs(gr[1].upvel - 1200.6) < 1e-9 && Math.abs(gr[1].hvel - 1450.2) < 1e-9,
+    `hvel=${gr[1].hvel} upvel=${gr[1].upvel}`);
+  check('a no-fix GPS row is kept but marked', gr[0].fixType === 0, 'fix 0 retained for gap accounting');
+}
+
+console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');
+process.exit(fails ? 1 : 0);

@@ -55,7 +55,7 @@ both dialects land in the same units):
 | `tilt_deg` | angle between rocket axis and vertical | `ang:` 1 ÷ 10 |
 | `roll_deg` | integrated roll about the rocket axis | `ang:` 2 |
 | `tilt_future_deg` | predicted tilt in +3 s (staging trigger) | `ang:` 3 ÷ 10 |
-| `fer` `fer_apo` `fer_main` `fer_third` `fer_fourth` | flight-event registers, hex-encoded bitmasks | `FER:` |
+| `fer` `fer_apo` `fer_main` `fer_third` `fer_fourth` | flight-event registers, hex bitmasks (see below) | `FER:` |
 
 ## Blue Raven — high rate (500 Hz)
 
@@ -78,13 +78,26 @@ Bit meanings come from the "Rocket events" table (rocket-level) plus the per-cha
 | 0 | Liftoff detected |
 | 1 | Apogee detected (2-of-3 vote: baro rising, total vel < 0, tilt > 90°) |
 | 2 | Pressure increasing (descending) |
-| 3 | Apo channel fired (+1.5 s) |
-| 4 | Main channel fired (+1.5 s) |
-| 5 | 3rd channel fired (+1.5 s) |
-| 6 | 4th channel fired (+1.5 s) |
+| 3 | Apo channel fired |
+| 4 | Main channel fired |
+| 5 | 3rd channel fired |
+| 6 | 4th channel fired |
 | 7 | ECI vertical velocity ≤ 0 |
 | 8 | Accel-only velocity ≤ 0 |
 | 9 | Tilt exceeded 90° |
+
+Bits are sticky: once set they stay set for the rest of the log, so an event's time is the *first*
+sample in which the bit reads set, and the resolution is one 20 ms low-rate frame. Bits 3-6 latch
+when the corresponding charge fires, which is what makes them usable as deployment timestamps; bit
+1 is the altimeter's own conclusion and can arrive a second or two after the airframe actually
+reaches apogee, so it is a cross-check rather than a measurement.
+
+Bits 7-9 need care. On the pad the airframe is level and stationary, but the accelerometers are
+noisy enough that the internally-integrated velocity wanders through zero, which sets bits 7 and 8
+before the rocket has moved - a pad `FER` of `180` is exactly this, and is normal. Because the bits
+are sticky that pad latch can never be seen again, so the reconstruction derives "tilt exceeded 90°"
+from the reported tilt angle rather than from bit 9, and does not use bits 7-9 at all as an
+inertial-health signal.
 
 ## GPS tracker (10 Hz)
 
@@ -111,6 +124,30 @@ TrkAlt5655 lt39.55612 ln-105.1032 Vel0 -1550 Fix3 #9 42 0 0
 
 Altitude is ASL; the flight computer reports AGL. The pad elevation is recovered from the GPS
 on-pad samples, which is one reason both files are needed.
+
+## Encoding rules the parsers apply
+
+These are the places where a file can be read two different ways, and what decides it.
+
+**Bitmask columns are hexadecimal.** The registers are documented as hex bitmasks written without a
+prefix, so `180` in a `fer` column is `0x180` (384), not 180. A token is read as hex when it carries
+a prefix or suffix (`0x1F`, `1Fh`) or contains a letter (`3A7`); a token made only of digits is read
+as hex too, because that is what the device writes. Write `180d` if you ever need decimal. In the
+native telemetry the raw token is used rather than a numeric scan, which would otherwise read `3A7`
+as `3`.
+
+**High-rate CSV columns are engineering units** - gyro in deg/s, accel in g, quaternion components
+dimensionless. Vendors' raw exports instead carry centi-unit integers (`2387` = 23.87 deg/s) and
+30000-scaled quaternion terms. Which one a file is gets decided from the data, not from the filename:
+if the median absolute gyro reading is more than ten times what an airframe plausibly does (40 deg/s)
+the gyro columns are divided by 100, likewise the accel columns against 1.2 g. This survives a
+spreadsheet re-export that stripped the column headers' meaning.
+
+**The quaternion is a unit quaternion**, stored axis-first as `[axis * sin(theta/2), cos(theta/2)]`,
+and it is renormalised on the way in, so a drifted or clipped estimate still points the right way.
+Where only three quaternion-like terms are present they are read as a rotation vector
+(`axis * theta/2`) and the fourth term is reconstructed. A raw export that multiplies the terms by
+30000 is detected per row from the vector magnitude and divided back down.
 
 ## Assumptions
 
