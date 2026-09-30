@@ -4,10 +4,88 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>flight-data-sim</title>
+    <meta name="description" content="Reconstruct a rocket flight from a Blue Raven flight-computer log and a GPS tracker log: trajectory, events, and the doubts attached to both." />
+    <title>Flight reconstruction · Blue Raven + GPS</title>
   </head>
   <body>
-    <div id="app"></div>
+    <header>
+      <div class="brand">
+        <h1>Flight&nbsp;reconstruction</h1>
+        <p>Blue Raven and GPS logs &rarr; one trajectory, the events in it, and the doubts attached to both.</p>
+      </div>
+      <div class="picker">
+        <select id="flight" aria-label="Bundled flight" disabled></select>
+        <label class="btn" for="files">Open logs&hellip;</label>
+        <input id="files" type="file" multiple accept=".csv,.txt,.log,.tsv" hidden />
+      </div>
+    </header>
+
+    <div id="status" class="status" role="status"></div>
+
+    <main id="app" hidden>
+      <section class="kpis" id="kpis" aria-label="Flight summary"></section>
+
+      <section class="column charts" aria-label="Flight profile">
+        <div class="panel chart" id="chart-alt"></div>
+        <div class="panel chart" id="chart-vel"></div>
+        <div class="panel chart" id="chart-acc"></div>
+        <div class="panel chart" id="chart-att"></div>
+      </section>
+
+      <section class="column side">
+        <div class="panel">
+          <div class="panel-h">
+            <span>Replay</span>
+            <span class="hint" id="replay-readout">drag to orbit, scroll to zoom</span>
+          </div>
+          <div id="replay"></div>
+          <div class="transport">
+            <button id="play" class="btn" title="Play / pause (space)" disabled>&#9654;</button>
+            <input id="scrub" type="range" min="0" max="1" step="0.02" value="0" aria-label="Time" disabled />
+            <select id="rate" aria-label="Replay rate" title="Replay rate">
+              <option value="1">1&times;</option>
+              <option value="5">5&times;</option>
+              <option value="10" selected>10&times;</option>
+              <option value="25">25&times;</option>
+              <option value="50">50&times;</option>
+              <option value="100">100&times;</option>
+            </select>
+            <button id="cam" class="btn" aria-pressed="true" title="Follow the airframe, or orbit the whole track (f)">follow</button>
+            <button id="replay-overview" class="btn" title="Frame the whole track">reset view</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-h">
+            <span>Events</span>
+            <span class="hint">decoded from the flight-event registers and the track itself</span>
+          </div>
+          <ol id="events" class="events"></ol>
+        </div>
+
+        <div class="panel">
+          <div class="panel-h"><span>How much to believe it</span></div>
+          <dl id="diag" class="diag"></dl>
+        </div>
+
+        <div class="panel">
+          <div class="panel-h"><span>Warnings</span></div>
+          <ul id="warnings" class="warnings"></ul>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <ul class="legend">
+        <li><span class="chip" style="background:var(--fused)"></span> fused: both logs agreeing</li>
+        <li><span class="chip" style="background:var(--br)"></span> inertial only: no fix nearby</li>
+        <li><span class="chip" style="background:var(--gps)"></span> GPS only: accelerometers distrusted</li>
+        <li><span class="chip" style="background:var(--imu)"></span> accelerometers as logged</li>
+        <li><span class="chip" style="background:var(--baro)"></span> barometric altitude</li>
+        <li><span class="dim">space play / pause &middot; &larr; &rarr; step, shift for 0.1 s &middot; f camera &middot; click a chart to seek</span></li>
+      </ul>
+    </footer>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
