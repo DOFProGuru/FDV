@@ -307,6 +307,23 @@ function renderDiagnostics(b: Bundle, st: FlightStats): void {
       'A row is a measurement only if it has a fix, at least four satellites and a dilution under 10. ' +
         `Longest hole in the used series: ${gap.toFixed(1)} s.`,
     ),
+    r.padRest
+      ? diagRow(
+          'At rest on the pad',
+          `${r.padRest.seconds.toFixed(1)} s over ${num(r.padRest.fixes)} fixes`,
+          'ok',
+          `The tracker saw the airframe stationary until ${tLabel(r.padRest.untilT)}, so the velocity was pinned to zero over that stretch and whatever the ` +
+            `accelerometers accumulated there is bias rather than motion - which is the only way this log can see bias at all. ` +
+            `Its reported velocity scatters by ${fps(r.padRest.velSigmaFps, 2)} ft/s about zero while still; during the ascent the two disagree by ` +
+            `${fps(r.noise.sigmaVelFps, 1)} ft/s, and that difference belongs to the airframe, not the tracker.`,
+        )
+      : diagRow(
+          'At rest on the pad',
+          'not found',
+          'warn',
+          'No stationary stretch at the head of the log - either the recording started after the vehicle moved or the platform itself was moving. ' +
+            'The velocity was never pinned to zero, so the accelerometer bias has nothing to be measured against and rides through the whole ascent.',
+        ),
     diagRow(
       'Pad',
       `${b.data.pad.lat.toFixed(5)}, ${b.data.pad.lon.toFixed(5)} · ${ft(b.data.pad.altFt)} ft MSL`,

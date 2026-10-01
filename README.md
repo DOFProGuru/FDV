@@ -26,7 +26,10 @@ CSV, and a GPS log. `npm run build && npm run preview` for the production bundle
 filter with an RTS smoother, solved per axis: the Blue Raven's velocity gives the *shape* at 50 Hz and
 the GPS gives absolute position and velocity. Where the two disagree, the filter is told which one to
 believe by rules taken from the hardware manual — gyro rates near the ±2000 deg/s clipping limit, tilt
-past 90° while still climbing, GPS rows with no fix or too few satellites.
+past 90° while still climbing, GPS rows with no fix or too few satellites. The seconds at the head of
+a log, when the airframe is demonstrably not moving, count as a measurement of their own: the velocity
+is pinned to zero there, which is the only place in a flight an accelerometer bias can be told apart
+from motion.
 
 The detail is in [FORMATS.md](FORMATS.md): every header alias accepted, every encoding rule, every
 undocumented assumption, and what each check is for. It is the part worth reading.
@@ -40,7 +43,13 @@ The app distinguishes these wherever it can, and the diagnostics panel says whic
 - **Registration** — the yaw between the tracker's frame and the pad's, fitted to vertical turns, with
   its standard error and residuals.
 - **GPS quality** — how many rows were rejected as measurements and why. A row with three satellites is
-  not a position.
+  not a position. The same panel separates the tracker's velocity noise, measured on the pad where the
+  truth is zero, from the 9–140 ft/s the two solutions disagree by in flight — the difference is the
+  airframe's, not the tracker's, and treating the smaller number as the in-flight sigma makes the
+  apogee worse.
+- **At rest on the pad** — how long the log starts out stationary, since the velocity is pinned to zero
+  over that stretch and the accelerometer bias is estimated against it. When no such stretch exists the
+  panel says so, because then the bias has nothing to be measured against and rides through the ascent.
 - **Attitude marker** — the manual does not say what vector the quaternion's imaginary part is. Both
   readings are tested against the independently reported tilt angle, per file, and the winner is used
   and named in the panel with its median disagreement. When neither fits, the marker is drawn from the
@@ -57,7 +66,7 @@ apogee within 0–2 ft and the track within 35–105 ft RMS, where the inertial 
 
 | command | what it establishes |
 | --- | --- |
-| `npm test` | the numerics on their own: eigendecomposition, the Huber fits, clock alignment, filter and smoother, parser encodings, the quaternion-reading detector |
+| `npm test` | the numerics on their own: eigendecomposition, the Huber fits, clock alignment, filter and smoother, parser encodings, the quaternion-reading detector, the GPS measurement gate, saturation episodes, the pad rest detection, logs with pieces missing |
 | `npm run verify` | the whole pipeline against `sample/truth/`, per flight |
 | `npm run smoke` | the page in a real headless Chrome: WebGL up, panels filled, nothing thrown, no NaN in the DOM (needs `npm run build && npm run preview` first) |
 | `npm run check` | types, over the app and the tools alike |

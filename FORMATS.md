@@ -190,9 +190,30 @@ Things the manuals do **not** pin down, stated so they can be corrected against 
 4. **Noise** — what the filter is told to expect of the GPS, estimated from the residuals of a
    straight-line fit through successive fixes, rather than assumed. If too few fixes survive, a
    documented fallback is used and marked `(fallback)` in the panel.
+   That velocity figure is an upper bound and knows it: on the sample logs it comes out at 9–140 ft/s,
+   which is largely the inertial solution's own error being blamed on the tracker. The tracker's real
+   velocity noise is measurable on the pad, where the answer is zero, and is 0.5–0.9 ft/s. Substituting
+   the smaller number improves the velocity against truth (f17 4.7 → 2.9 ft/s RMS) and worsens the
+   position, taking the apogee error from 1 ft to 10 ft and the tumbling flight's from 0 ft to 40 ft: a
+   Doppler solution that is quiet while bolted to a rail is a different instrument under 35 g. The
+   ascent keeps the pessimistic figure; the pad figure is reported in the panel as a property of the
+   tracker, not as a sigma.
 5. **Fuse** — error-state Kalman filter plus a Rauch-Tung-Striebel smoother, solved independently
    per axis: state `[δp, δv, δb]`, the Blue Raven velocity as the control input (its *shape* at
    50 Hz, which is where its value is), and GPS position and velocity as measurements.
+   - The airframe sits motionless on the rail for the first seconds of a log, which is the only stretch
+     where the velocity is known to be zero without asking either sensor, and therefore the only place
+     an accelerometer *bias* can be told apart from motion — the one error that integrates twice, into
+     velocity and then into position. The velocity is pinned to zero over that stretch (`padRestEnd`)
+     and the bias state absorbs whatever the inertial solution accumulated there. The constraint stops
+     at the first hint of movement less 0.25 s, not at the proof of it: Doppler confirms motion a few
+     tenths of a second late, and holding a zero-velocity constraint one fix into a 35 g boost costs
+     the whole ascent about 20 ft/s. It refuses to run at all unless the log starts stationary and the
+     fixes stay within 60 ft of one another — a platform that wanders is a truck, not a pad. On the
+     bundled flights the constraint holds to 0.2 s before liftoff; how long it can hold is bounded by
+     where the *GPS* log starts, which on the tumbling flight is barely a second before the rail lets
+     go. Post-landing stillness is not used, and should be: it would catch a barometric drift that
+     nothing else can see.
    - A GPS row is a measurement only if it reports a fix, at least four satellites and a dilution
      below 10. A row the tracker itself does not believe in is worse than no row: it pulls the
      trajectory toward a position that may be miles out. Rows that fail are counted in the panel.
@@ -214,7 +235,8 @@ Things the manuals do **not** pin down, stated so they can be corrected against 
 
 | command | what it establishes |
 | --- | --- |
-| `npm test` | the numerics in isolation: eigendecomposition, the Huber fits, clock alignment, the filter and smoother, and the parser encoding rules |
+| `npm run check` | types, over `src` and `tools` alike — the check that turned up three debuggers still calling a parser signature from two revisions ago |
+| `npm test` | the numerics in isolation: eigendecomposition, the Huber fits, clock alignment, the filter and smoother, the parser encoding rules, the GPS measurement gate, the quaternion-convention detector, the saturation episode merger, the pad rest detection, and the degraded input paths |
 | `npm run verify -- f17-nominal` | the whole pipeline against the simulator's truth, which the app never reads: apogee, clock offset, position and velocity RMS against truth |
 | `npm run smoke` | the page in a real headless Chrome over the DevTools protocol: WebGL came up, the panels filled in, nothing threw, no NaN reached the DOM |
 

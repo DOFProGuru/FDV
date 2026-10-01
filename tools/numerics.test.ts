@@ -451,5 +451,54 @@ function check(name: string, ok: boolean, detail = '') {
   check('no flight-computer log is refused by name rather than by a crash', refused, why);
 }
 
+// --- recognising an airframe that is not moving ------------------------------
+{
+  const { padRestEnd, reconstruct, derivePad } = await import('../src/lib/fusion.ts');
+  const v = (e: number, n: number, u: number) => ({ e, n, u });
+  const t: number[] = [];
+  const p: { e: number; n: number; u: number }[] = [];
+  const vel: { e: number; n: number; u: number }[] = [];
+  for (let i = 0; i < 40; i++) { t.push(i * 0.1); p.push(v(1, -1, 0)); vel.push(v(0.3, -0.2, 0.1)); }
+  for (let i = 40; i < 90; i++) { t.push(i * 0.1); p.push(v(1 + (i - 40) * 40, -1, 0)); vel.push(v(300, 0, 0)); }
+
+  // Motion becomes visible at 4.00 s; the constraint has to stop before that, because Doppler proves
+  // the vehicle has moved a moment after it does, and a zero-velocity fix one epoch into the boost is
+  // worse than none.
+  const still = padRestEnd(t, p, vel);
+  check('the rest of the pad is found, and ends before the vehicle starts moving',
+    !!still && Math.abs(still.untilT - 3.75) < 0.02 && still.fixes === 38,
+    still ? `until ${still.untilT.toFixed(2)} s, ${still.fixes} fixes, vel sigma ${still.velSigmaFps.toFixed(2)} ft/s` : 'null');
+
+  check('a log that begins in motion has no rest to it', padRestEnd(t, p, t.map(() => v(300, 0, 0))) === null);
+
+  const jitter = vel.map((x, i) => (i === 10 ? v(400, 0, 0) : x));
+  const afterJitter = padRestEnd(t, p, jitter);
+  check('one fix over the threshold is a jittery Doppler solution, not a launch',
+    !!afterJitter && Math.abs(afterJitter.untilT - 3.75) < 0.02, afterJitter ? `until ${afterJitter.untilT.toFixed(2)} s` : 'null');
+
+  const rolling = t.map((_, i) => v(i * 8, 0, 0));
+  check('a platform that wanders while reporting no speed is not pinned to zero', padRestEnd(t, rolling, vel) === null);
+
+  const shortT = t.map((x) => x * 0.1);
+  check('a rest stretch shorter than a second proves nothing', padRestEnd(shortT, p, vel) === null);
+
+  // What that buys: the same log, fused with and without the constraint.
+  const { parseBlueRaven } = await import('../src/lib/parsers/blueRaven.ts');
+  const { parseGps } = await import('../src/lib/parsers/gps.ts');
+  const { readFileSync } = await import('node:fs');
+  const read = (f: string) => readFileSync(new URL(`../public/data/${f}`, import.meta.url), 'utf8');
+  const low = parseBlueRaven(read('f52-tumble_blue_raven_low.csv'));
+  const high = parseBlueRaven(read('f52-tumble_blue_raven_high.csv'));
+  const gpsP = parseGps(read('f52-tumble_gps.csv'));
+  const pad = derivePad(gpsP.rows, low.low).pad;
+  const meta = { brDialect: low.dialect, gpsDialect: gpsP.dialect, warnings: [] as string[] };
+  const r = reconstruct({ brLow: low.low, brHigh: high.high, gps: gpsP.rows, pad, meta });
+  const speedOf = (i: number) => Math.hypot(r.fused.v[i].e, r.fused.v[i].n, r.fused.v[i].u);
+  const onPad = r.fused.t.map((tt, i) => (tt < -0.5 ? speedOf(i) : 0));
+  const padMax = Math.max(...onPad);
+  check('the reconstructed rocket does not move while it is still on the rail', padMax < 0.5, `max ${padMax.toFixed(2)} ft/s before liftoff`);
+  check('and the rest of the log is still where the tracker says it is', Math.abs(r.stats.maxAltFt - 9226) < 40, r.stats.maxAltFt.toFixed(0));
+}
+
 console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');
 process.exit(fails ? 1 : 0);

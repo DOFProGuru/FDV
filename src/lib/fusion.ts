@@ -36,6 +36,8 @@ export interface FusionTuning {
   velDynamic: number;
   /** Huber threshold for the registration IRLS, in robust sigmas */
   huberK: number;
+  /** how sure we are that a rocket sitting on the rail has zero velocity (ft/s) */
+  zuptVelFps: number;
 }
 
 export const DEFAULT_TUNING: FusionTuning = {
@@ -47,6 +49,7 @@ export const DEFAULT_TUNING: FusionTuning = {
   posDynamic: 0.012,
   velDynamic: 0.006,
   huberK: 1.8,
+  zuptVelFps: 0.3,
 };
 
 export interface Reconstruction {
@@ -61,6 +64,8 @@ export interface Reconstruction {
   noise: { sigmaPosFt: number; sigmaVelFps: number; estimated: boolean };
   /** how the two Blue Raven logs were put on one time axis, from the shared sync counter */
   brSync: { offsetS: number; residualMs: number; aliased: boolean } | null;
+  /** the stationary stretch at the head of the log, where the velocity is pinned to zero */
+  padRest: { untilT: number; seconds: number; fixes: number; velSigmaFps: number } | null;
   durationS: number;
   warnings: string[];
 }
@@ -593,6 +598,96 @@ export function register(
 
 // --- reconstruction ----------------------------------------------------------
 /** ISA speed of sound, ft/s. Exported so the UI can label a Mach trace with the same physics. */
+/**
+ * Where the airframe stops being at rest, in the fused time frame, or null if the log never starts
+ * that way.
+ *
+ * Nothing states the accelerometer bias as directly as a vehicle that has not moved for five seconds:
+ * the true velocity is known to be zero without consulting either sensor, so everything the inertial
+ * solution accumulated over those seconds is bias, and bias is the one error that integrates twice -
+ * once into velocity, once into position - and therefore the one that survives the whole ascent. The
+ * filter's own measurements cannot do this: a tracker's velocity is good to half a foot per second but
+ * its *position* differenced over 0.1 s is good to about 5 ft/s, which is the size of the error being
+ * argued about.
+ *
+ * Two things have to be true, because the alternative is pinning a moving launch platform to zero.
+ * The reported speed has to stay down, and the fixes actually have to stay in one place.
+ */
+export function padRestEnd(
+  t: number[],
+  p: Vec3[],
+  v: Vec3[],
+  opts: { maxSpeedFps?: number; minSeconds?: number; maxDriftFt?: number; marginS?: number } = {},
+): { untilT: number; seconds: number; fixes: number; velSigmaFps: number } | null {
+  const maxSpeed = opts.maxSpeedFps ?? 5;
+  const minSeconds = opts.minSeconds ?? 1;
+  const maxDrift = opts.maxDriftFt ?? 60;
+  const marginS = opts.marginS ?? 0.25;
+  const speed = (k: number) => (k < v.length ? Math.hypot(v[k].e, v[k].n, v[k].u) : NaN);
+  const moving = (k: number) => {
+    const s = speed(k);
+    return Number.isFinite(s) && s > maxSpeed;
+  };
+
+  let iFirst = -1;
+  for (let k = 0; k < t.length; k++) {
+    // One fix over the threshold is a jittery Doppler solution, not a launch: three in a row.
+    if (moving(k) && moving(k + 1) && moving(k + 2)) {
+      iFirst = k;
+      break;
+    }
+  }
+  if (iFirst < 1) return null; // never at rest, or already moving at the first fix
+
+  const seconds = t[iFirst] - t[0];
+  // The scatter of the reported velocity about zero, over the stretch before the tracker itself
+  // started reporting motion, is that tracker's own noise - measured, not inferred. Registration can
+  // only ever overstate it, because its residuals are inertial error as much as GPS error.
+  const perAxis = [0, 1, 2].map((a) =>
+    madScale(v.slice(0, iFirst).map((x) => [x.e, x.n, x.u][a]).filter((x) => Number.isFinite(x))),
+  );
+  const velSigmaFps = Math.sqrt(perAxis.reduce((s, x) => s + x * x, 0) / 3);
+
+  // Doppler says "moving" a few tenths of a second after the retention fails, and a zero-velocity
+  // constraint applied one fix into the boost is worse than no constraint at all: at 35 g, half a
+  // second of wrong initial velocity is 20 ft/s the whole ascent then carries. So the constraint ends
+  // at the first *hint* of movement, not at the proof of it, and a margin on top. How big a hint is,
+  // scaled by how noisy this particular tracker is while standing still - but capped at the detection
+  // threshold, so that a noisy tracker can never stretch the constraint across liftoff.
+  const hintAt = Math.min(maxSpeed, Math.max(maxSpeed * 0.5, 4 * velSigmaFps));
+  let hintT = t[iFirst];
+  for (let k = iFirst - 1; k >= 0; k--) {
+    // Same rule as the detection: a single fix above the line is the Doppler solution being excited,
+    // not the vehicle moving, and it must not be allowed to cut the rest window short.
+    if (speed(k) > hintAt && speed(k + 1) > hintAt) {
+      hintT = t[k];
+      break;
+    }
+  }
+  const untilT = hintT - marginS;
+  if (!(untilT - t[0] >= minSeconds)) return null;
+  let fixes = 0;
+  const es: number[] = [];
+  const ns: number[] = [];
+  for (let k = 0; k < iFirst; k++) {
+    if (!Number.isFinite(speed(k)) || t[k] >= untilT) continue;
+    fixes++;
+    es.push(p[k].e);
+    ns.push(p[k].n);
+  }
+  if (seconds < minSeconds || fixes < 4) return null;
+
+  // Scatter of the fixes about their own middle is antenna noise; a real offset of the middle from
+  // the first fix is the platform driving away.
+  const med = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+  const e0 = med(es);
+  const n0 = med(ns);
+  const drift = Math.max(...es.map((e, i) => Math.hypot(e - e0, ns[i] - n0)));
+  if (!(drift < maxDrift)) return null;
+
+  return { untilT, seconds: untilT - t[0], fixes, velSigmaFps };
+}
+
 export function speedOfSoundFps(altFt: number): number {
   const hM = Math.max(0, altFt * 0.3048);
   const T = hM < 11000 ? 288.15 - 0.0065 * hM : 216.65; // ISA troposphere / tropopause
@@ -693,8 +788,19 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
     warnings.push(`Only ${(reg.inlierFraction * 100).toFixed(0)}% of GPS fixes agree with the inertial path; the inertial solution drifted and is being over-ridden wherever GPS is available.`);
   }
 
+  // --- 2b. being still is a measurement too ----------------------------------
+  const rest = padRestEnd(gps.t, gps.p, gps.v);
+  const zuptR = tuning.zuptVelFps ** 2;
+
   const sigmaPos = Math.max(tuning.sigmaPosMin, Number.isFinite(reg.sigmaPosFt) ? reg.sigmaPosFt * 1.3 : 12);
   const sigmaVel = Math.max(tuning.sigmaVelMin, Number.isFinite(reg.sigmaVelFps) ? reg.sigmaVelFps * 1.3 : 2);
+  // rest.velSigmaFps is the same quantity measured a second way, and it is much smaller: on the
+  // sample logs it is 0.5-0.8 ft/s against the 23-140 ft/s registration reports. Using the smaller
+  // number makes the velocity error markedly better (f17 5.70 -> 2.88 ft/s) and the *position* worse
+  // (apogee error 1 -> 10 ft, and 0 -> 40 ft on the tumble), because a Doppler solution that is quiet
+  // while bolted to a rail is a different instrument under 40 g: the antenna phase centre moves with
+  // the airframe, and aiding degrades with acceleration. Registration's number is the honest one for
+  // the ascent; the pad number is reported as a property of the tracker, not used as a sigma here.
 
   // --- 3. time-varying trust in the inertial solution -------------------------
   const useHigh = !!brHigh?.length;
@@ -739,6 +845,15 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
         updates++;
       }
       j++;
+    }
+    if (rest && tBr[i] <= rest.untilT) {
+      // True velocity is zero, so the error state has to cancel the whole of the nominal. This has to
+      // happen before the epoch is recorded: the smoother reads the stored updated state, and a
+      // constraint applied after the recording would steer the forward pass and vanish from the
+      // smoothed answer.
+      filters[0].update(1, -registered.v[i].e, zuptR);
+      filters[1].update(1, -registered.v[i].n, zuptR);
+      filters[2].update(1, -registered.v[i].u, zuptR);
     }
     for (const f of filters) {
       f.xUpd.push([...f.x] as [number, number, number]);
@@ -806,6 +921,7 @@ export function reconstruct(data: FlightData, tuning: FusionTuning = DEFAULT_TUN
     clock: { gpsOffsetS: clock.offset, score: clock.score, runnerUpScore: clock.runnerUpScore, anchorAgreementS: clock.anchorAgreementS },
     noise: { sigmaPosFt: sigmaPos, sigmaVelFps: sigmaVel, estimated: Number.isFinite(reg.sigmaPosFt) },
     brSync: sync,
+    padRest: rest,
     durationS: tBr[n - 1] - tBr[0],
     warnings,
   };
