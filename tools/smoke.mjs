@@ -225,6 +225,66 @@ const run = async () => {
   const realProblems = problems.filter((p) => !noise.test(p));
   for (const p of realProblems) bad.push(p);
 
+  // --- behaviour, not just appearance ---------------------------------------
+  // The DOM probe says the panels are filled in. It says nothing about whether the keyboard and the
+  // charts do anything, and those are wired by hand, which is exactly where mistakes live. The
+  // readout carries the cursor time to 0.1 s, which is fine enough to see a step.
+  const readoutTime = async () => {
+    const r = await send('Runtime.evaluate', {
+      expression: `document.getElementById('replay-readout')?.textContent ?? ''`,
+      returnByValue: true,
+    });
+    const text = String(r.result?.value ?? '');
+    lastReadout = text;
+    const m = /T\s*([+\u2212-])\s*(\d+):(\d+(?:\.\d+)?)/.exec(text);
+    if (!m) return NaN;
+    return (m[1] === '-' || m[1] === '\u2212' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+  };
+  const key = (code, keyName, extra = {}) =>
+    send('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      code,
+      key: keyName,
+      windowsVirtualKeyCode: code === 'Space' ? 32 : code === 'ArrowRight' ? 39 : 37,
+      ...extra,
+    }).then(() => send('Input.dispatchKeyEvent', { type: 'keyUp', code, key: keyName }));
+  let lastReadout = '';
+  const steps = [];
+  try {
+    await send('Page.enable');
+    const t0 = await readoutTime();
+    await key('ArrowRight', 'ArrowRight');
+    await sleep(250);
+    const t1 = await readoutTime();
+    steps.push({ what: 'right arrow steps a second forward', ok: t1 - t0 > 0.5 && t1 - t0 < 2, detail: `${t0} to ${t1}  readout=${JSON.stringify(lastReadout)}` });
+
+    await key('ArrowLeft', 'ArrowLeft', { modifiers: 8 });
+    await sleep(250);
+    const t2 = await readoutTime();
+    steps.push({ what: 'shift+left steps back a tenth', ok: Math.abs(t2 - t1) > 0.05 && Math.abs(t2 - t1) < 0.5, detail: `${t1} to ${t2}` });
+
+    // Clicking a chart is how you seek to something you can see on it.
+    const box = await send('Runtime.evaluate', {
+      expression: `(() => { const r = document.querySelectorAll('.chart')[0].getBoundingClientRect(); return JSON.stringify([r.left + r.width * 0.62, r.top + r.height * 0.5]); })()`,
+      returnByValue: true,
+    });
+    const [cx, cy] = JSON.parse(box.result.value);
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1, buttons: 1 });
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 });
+    await sleep(300);
+    const t3 = await readoutTime();
+    steps.push({ what: 'clicking a chart seeks', ok: Math.abs(t3 - t2) > 1, detail: `${t2} to ${t3}` });
+
+    await key('Space', ' ');
+    await sleep(700);
+    const t4 = await readoutTime();
+    steps.push({ what: 'space plays', ok: t4 > t3 + 0.2, detail: `${t3} to ${t4} in 0.7 s of wall clock` });
+  } catch (e) {
+    steps.push({ what: 'interaction', ok: false, detail: String(e) });
+  }
+  for (const st of steps) console.log(`  ${st.ok ? 'ok  ' : 'MISS'} ${st.what}  ${st.detail}`);
+  for (const st of steps) if (!st.ok) bad.push(`interaction failed: ${st.what} (${st.detail})`);
+
   if (shot) {
     await send('Page.enable');
     const { data } = await send('Page.captureScreenshot', { format: 'png' });

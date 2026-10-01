@@ -524,8 +524,10 @@ function wire(): void {
 
   window.addEventListener('keydown', (ev) => {
     if (!rec) return;
+    // Keys belong to whatever has focus. A focused button already activates on space, so handling
+    // the same keypress here would toggle playback twice and look like a dead key.
     const tag = (ev.target as HTMLElement | null)?.tagName;
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
     if (ev.code === 'Space') {
       ev.preventDefault();
       setPlaying(!playing);
