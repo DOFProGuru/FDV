@@ -8,11 +8,14 @@
  * Feet are rescaled per flight to put the whole trajectory in a ~1000-unit box: the depth buffer
  * gets some room, the orbit limits mean something, and a scene the size of a missile range does not
  * have to be rendered at missile-range scale.
+ *
+ * Everything that decides what the panel shows when a flight appears lives under "framing" below.
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { FlightEvents, FusedSample } from '../lib/types.ts';
 import type { AttitudeResolver } from './attitude.ts';
+import { axesOf, distanceToFrame, frameTrack, panIntoFrame, viewDirection, type Tan } from './framing.ts';
 import { C, KIND_COLOR } from './palette.ts';
 
 
@@ -40,6 +43,22 @@ export interface FlightGeometry {
 }
 
 const FT_STEPS = [100, 200, 500, 1000, 2000, 2640, 5280, 10560, 21120, 42240];
+
+/** how high the default view sits above the pad plane, in the same ballpark as the view before */
+const FIT_ELEVATION = (27 * Math.PI) / 180;
+/** headroom left around the track when framing it. 1.25 is not cosmetic: it is what keeps the part
+ *  of the track already flown on screen while follow slides the camera around it. */
+const FIT_MARGIN = 1.25;
+/** the airframe is followed by moving the camera no more than it takes to keep it inside this box,
+ *  as a fraction of the half-panel */
+const FOLLOW_BOX_X = 0.75;
+const FOLLOW_BOX_Y = 0.68;
+
+/** the view's half-widths in tangent units, aspect ratio and all */
+function tanOfView(camera: THREE.PerspectiveCamera): Tan {
+  const y = Math.tan((camera.fov * Math.PI) / 360);
+  return { x: y * (camera.aspect || 1), y };
+}
 
 function textSprite(text: string, color: string, height: number): THREE.Sprite {
   const cv = document.createElement('canvas');
@@ -75,6 +94,12 @@ export class Replay3D {
   private dirty = true;
   private scale = 1;
   private mark = 1;
+  /** a framing that could not be applied yet: a panel in a hidden drawer has no size to fit against */
+  private fitWanted = false;
+  /** the pointer has taken the camera, so nothing moves it again except the pointer */
+  private userOrbit = false;
+  /** the clock time the present framing was composed for; see setTime */
+  private framedAt = NaN;
 
   private times = new Float64Array(0);
   private pos = new Float32Array(0);
@@ -101,6 +126,9 @@ export class Replay3D {
     this.controls.minDistance = 6;
     this.controls.maxDistance = 6000;
     this.controls.addEventListener('change', () => { this.dirty = true; });
+    // OrbitControls reports 'start' for a drag and for the wheel, which is the line between the app
+    // framing the flight and the user framing it.
+    this.controls.addEventListener('start', () => { this.userOrbit = true; });
 
     this.scene.add(new THREE.HemisphereLight(0xc3c9ff, 0x12101a, 1.4));
     const key = new THREE.DirectionalLight(0xffffff, 2.4);
@@ -152,7 +180,6 @@ export class Replay3D {
       }
     }
     this.mark = Math.max(4, (hi.y - lo.y) * 0.012);
-    const size = hi.distanceTo(lo);
 
     const posAttr = new THREE.BufferAttribute(this.pos, 3) as THREE.Float32BufferAttribute;
     const colAttr = new THREE.BufferAttribute(new Float32Array(n * 3), 3) as THREE.Float32BufferAttribute;
@@ -210,7 +237,7 @@ export class Replay3D {
       this.flight.add(m);
     }
 
-    this.addGround();
+    const grid = this.addGround();
     this.addRocket();
     this.addLabel('PAD', C.br, new THREE.Vector3(0, this.mark * 3.2, 0));
     const land = g.events.find((e) => e.code === 'landing');
@@ -218,25 +245,31 @@ export class Replay3D {
       const i = this.indexAt(land.t);
       this.addLabel('LAND', C.good, new THREE.Vector3(this.pos[i * 3], this.mark * 1.6, this.pos[i * 3 + 2]));
     }
-    const edge = Math.max(Math.abs(hi.x), Math.abs(lo.x), Math.abs(hi.z), Math.abs(lo.z)) * 0.94;
-    this.addLabel('N', C.dim, new THREE.Vector3(0, this.mark, -edge));
-    this.addLabel('E', C.dim, new THREE.Vector3(edge, this.mark, 0));
+    this.addLabel('N', C.dim, new THREE.Vector3(0, this.mark, -grid * 0.9));
+    this.addLabel('E', C.dim, new THREE.Vector3(grid * 0.9, this.mark, 0));
 
-    this.fitCamera(lo, hi, size);
+    this.fitTrack();
     this.lastIdx = -1;
     this.datumX = null;
     this.dirty = true;
   }
 
-  private addGround(): void {
-    const ftPerUnit = 1000 / this.scale / 1000;
-    const step = FT_STEPS.find((s) => 1000 / ftPerUnit / s <= 12) ?? FT_STEPS[FT_STEPS.length - 1];
-    const divs = Math.max(6, Math.ceil(1000 / (step * ftPerUnit)));
-    const fine = new THREE.GridHelper(step * ftPerUnit * divs, divs, 0x3a334a, 0x241f2e);
+  /** the ground the track lies on: a grid of round feet over the width of the scene, the pad and
+   *  its rail. Returns the half-extent, which is where the compass labels go. */
+  private addGround(): number {
+    // The scene is ~1000 units wide and ~1000/this.scale feet wide, so a cell of `step` feet is
+    // step*scale units across. Dividing rather than multiplying here is what left the grid tens of
+    // times wider than the flight, with its two visible lines nowhere near the track.
+    const spanFt = 1000 / this.scale; // the scene is ~1000 units wide, this.scale is units per foot
+    const step = FT_STEPS.find((s) => spanFt / s <= 12) ?? FT_STEPS[FT_STEPS.length - 1];
+    const cell = step * this.scale;
+    const divs = Math.max(6, Math.min(12, Math.ceil(spanFt / step)));
+    const width = cell * divs;
+    const fine = new THREE.GridHelper(width, divs, 0x3a334a, 0x241f2e);
     (fine.material as THREE.Material).transparent = true;
     (fine.material as THREE.Material).opacity = 0.8;
     this.flight.add(fine);
-    const major = new THREE.GridHelper(step * ftPerUnit * divs, Math.max(2, Math.round(divs / 5)), 0x4d4363, 0x4d4363);
+    const major = new THREE.GridHelper(width, Math.max(1, Math.round(divs / 5)), 0x4d4363, 0x4d4363);
     (major.material as THREE.Material).transparent = true;
     (major.material as THREE.Material).opacity = 0.45;
     major.position.y = -0.05;
@@ -254,6 +287,7 @@ export class Replay3D {
       new THREE.LineBasicMaterial({ color: C.br, transparent: true, opacity: 0.65 }),
     );
     this.flight.add(rail);
+    return width / 2;
   }
 
   private addLabel(text: string, color: string, at: THREE.Vector3): void {
@@ -326,9 +360,12 @@ export class Replay3D {
     this.lastIdx = i;
 
     if (this.follow) {
-      const d = p.clone().sub(this.controls.target);
-      this.controls.target.add(d);
-      this.camera.position.add(d);
+      // The framing set with a flight is composed around the clock position the flight arrives at,
+      // and the caller immediately seeks to that same position. Following starts when the clock
+      // starts moving, so that first seek cannot turn a view of the whole flight into a view of the
+      // launch pad.
+      if (Number.isFinite(this.framedAt) && Math.abs(t - this.framedAt) > 1e-9) this.panToAirframe(p);
+      else this.framedAt = t;
     }
     this.dirty = true;
   }
@@ -359,15 +396,76 @@ export class Replay3D {
     return new THREE.Quaternion().setFromRotationMatrix(m);
   }
 
-  // --- camera -----------------------------------------------------------------
-  private fitCamera(lo: THREE.Vector3, hi: THREE.Vector3, size: number): void {
-    const mid = lo.clone().add(hi).multiplyScalar(0.5);
-    mid.y = lo.y + (hi.y - lo.y) * 0.45;
-    this.controls.target.copy(mid);
-    const d = (size * 1.35) / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
-    this.camera.position.set(mid.x + d * 0.55, mid.y + d * 0.5, mid.z + d * 0.8);
-    this.camera.lookAt(mid);
+  // --- framing ----------------------------------------------------------------
+  /**
+   * The default view of a flight: the whole track, from the side it was flown from, as large as the
+   * panel allows. framing.ts has the geometry and the reasons for it; what is decided here is when it
+   * happens - when a flight loads, when 'reset view' is pressed, and whenever the panel changes shape
+   * while the user has not taken the camera over.
+   */
+  private fitTrack(): void {
+    this.userOrbit = false;
+    this.framedAt = NaN;
+    this.fitWanted = true;
+    this.applyFit();
+  }
+
+  /** A flight is loaded while the replay panel is still in a hidden drawer, where it has no size to
+   *  fit an aspect ratio against, so the request stands until resize() reports one. */
+  private applyFit(): void {
+    if (!this.samples.length || this.host.clientWidth < 10 || this.host.clientHeight < 10) return;
+    this.fitWanted = false;
+    const view = frameTrack(
+      this.pos,
+      tanOfView(this.camera),
+      viewDirection(this.pos, FIT_ELEVATION),
+      FIT_MARGIN,
+      this.controls.maxDistance,
+    );
+    this.controls.target.copy(view.target);
+    this.camera.position.copy(view.position);
+    this.camera.lookAt(view.target);
+    this.controls.update();
     this.dirty = true;
+  }
+
+  /**
+   * Slide the camera across the track - no turn, no zoom - just far enough to bring the airframe
+   * back inside FOLLOW_BOX. Following it all the way to the middle of the frame, which is what this
+   * replaced, is the wrong trade: an airframe a few tens of units tall held in the centre of a view
+   * framed 1.25 times around a 1000-unit flight is a track pushed off the edges of a panel 300 px
+   * high, and the track is what the panel is for. The box is loose enough to hold the whole flight
+   * from launch to landing, so the camera only moves when it has to and the shape of the flight stays
+   * in picture.
+   */
+  private panToAirframe(p: THREE.Vector3): void {
+    const tan = tanOfView(this.camera);
+    for (let pass = 0; pass < 2; pass++) {
+      const dir = this.camera.position.clone().sub(this.controls.target);
+      if (dir.lengthSq() < 1e-12) return;
+      const { look, right, up } = axesOf(dir.normalize());
+      this.camera.updateMatrixWorld();
+      const s = p.clone().project(this.camera);
+      const depth = p.clone().sub(this.camera.position).dot(look);
+      const pan = panIntoFrame(s, depth, tan, { x: FOLLOW_BOX_X, y: FOLLOW_BOX_Y }, { right, up });
+      if (!pan) return;
+      this.controls.target.add(pan);
+      this.camera.position.add(pan);
+      this.camera.lookAt(this.controls.target);
+    }
+  }
+
+  /** A panel that has become narrower or shorter can crop a track that fitted before it; stand
+   *  further back along the same line of sight to keep it whole. */
+  private pullBackToFrame(): void {
+    if (!this.samples.length) return;
+    const need = distanceToFrame(this.pos, tanOfView(this.camera), this.camera.position, this.controls.target);
+    if (need <= 0) return;
+    const dir = this.camera.position.clone().sub(this.controls.target).normalize();
+    this.camera.position
+      .copy(this.controls.target)
+      .addScaledVector(dir, Math.min(need * FIT_MARGIN, this.controls.maxDistance));
+    this.camera.lookAt(this.controls.target);
   }
 
   setFollow(on: boolean): void {
@@ -375,19 +473,13 @@ export class Replay3D {
     this.dirty = true;
   }
 
+  /** frame the whole track, and stop following: 'reset view' gives the view a flight loads with. */
   overview(): void {
-    const n = this.samples.length;
-    if (!n) return;
-    let lo = new THREE.Vector3(Infinity, Infinity, Infinity);
-    let hi = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
-    for (let i = 0; i < n; i++) {
-      const v = new THREE.Vector3(this.pos[i * 3], this.pos[i * 3 + 1], this.pos[i * 3 + 2]);
-      lo.min(v);
-      hi.max(v);
-    }
+    if (!this.samples.length) return;
     this.follow = false;
-    this.fitCamera(lo, hi, Math.max(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z));
+    this.fitTrack();
   }
+
   // --- plumbing ---------------------------------------------------------------
   resize(): void {
     const w = this.host.clientWidth, h = this.host.clientHeight;
@@ -395,6 +487,11 @@ export class Replay3D {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    // A flight is loaded while the panel is still hidden, so the framing it was given was computed
+    // against no aspect ratio at all; apply it once there is one. Until the pointer takes over, keep
+    // the track framed across whatever panel it ends up in.
+    if (this.fitWanted) this.applyFit();
+    else if (!this.userOrbit) this.pullBackToFrame();
     this.dirty = true;
   }
 

@@ -2,7 +2,27 @@
 import { procrustesWeighted, yawFitWeighted, matVec, matMul, transpose, jacobiEigen, ident } from '../src/lib/linalg.ts';
 import { alignByAnchors, alignByCrossCorrelation } from '../src/lib/signal.ts';
 import { AxisFilter } from '../src/lib/fusion.ts';
+import { axesOf, distanceToFrame, frameTrack, panIntoFrame, viewDirection } from '../src/ui/framing.ts';
 import type { QuatEpoch } from '../src/ui/attitude.ts';
+import * as THREE from 'three';
+
+/** the on-screen box a track lands in, in normalised device coordinates */
+type Box = { x0: number; x1: number; y0: number; y1: number };
+
+function projectBox(pos: Float32Array, cam: THREE.PerspectiveCamera, upto = pos.length / 3): Box {
+  const b: Box = { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity };
+  const v = new THREE.Vector3();
+  for (let i = 0; i < upto; i++) {
+    v.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    if (!Number.isFinite(v.x + v.y + v.z)) continue;
+    v.project(cam);
+    b.x0 = Math.min(b.x0, v.x);
+    b.x1 = Math.max(b.x1, v.x);
+    b.y0 = Math.min(b.y0, v.y);
+    b.y1 = Math.max(b.y1, v.y);
+  }
+  return b;
+}
 
 let fails = 0;
 function check(name: string, ok: boolean, detail = '') {
@@ -498,6 +518,130 @@ function check(name: string, ok: boolean, detail = '') {
   const padMax = Math.max(...onPad);
   check('the reconstructed rocket does not move while it is still on the rail', padMax < 0.5, `max ${padMax.toFixed(2)} ft/s before liftoff`);
   check('and the rest of the log is still where the tracker says it is', Math.abs(r.stats.maxAltFt - 9226) < 40, r.stats.maxAltFt.toFixed(0));
+}
+
+// --- default framing of a flight ----------------------------------------------
+// What the 3-D view shows when a flight appears. A 408x300 px panel that fills a third of its
+// width with a flight path is the complaint these checks exist to keep from coming back.
+{
+  const FOV = 46, MARGIN = 1.25, ELEV = (27 * Math.PI) / 180, MAXD = 6000;
+  // setFlight rescales a flight so its dominant span is ~1000 scene units; the tracks below are
+  // built the same way so the numbers mean what they mean in the panel.
+  const track = (f: (u: number) => [number, number, number], n = 300): Float32Array => {
+    const a = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const p = f(i / (n - 1));
+      a.set(p, i * 3);
+    }
+    let span = 0;
+    for (let k = 0; k < 3; k++) {
+      let lo = Infinity, hi = -Infinity;
+      for (let i = k; i < a.length; i += 3) { lo = Math.min(lo, a[i]); hi = Math.max(hi, a[i]); }
+      span = Math.max(span, hi - lo);
+    }
+    for (let i = 0; i < a.length; i++) a[i] *= 1000 / span;
+    return a;
+  };
+  const panels: [string, number][] = [
+    ['desktop panel', 408 / 300],
+    ['wide panel', 1100 / 300],
+    ['tall panel', 320 / 460],
+  ];
+  // four ways a rocket can leave the pad: out east, up and back down, due north, and on a diagonal
+  const tracks: [string, Float32Array, (ndc: Box) => boolean, string][] = [
+    ['east', track((u) => [4000 * u, 900 * Math.sin(Math.PI * Math.pow(u, 0.7)), 60 * Math.sin(u * 9)]),
+      (b) => b.x1 - b.x0 > 1.4, 'the ground track uses the width of the panel'],
+    ['up and back', track((u) => [30 * Math.sin(u * 7), 1000 * Math.sin(Math.PI * u), 24 * Math.cos(u * 5)]),
+      (b) => b.y1 - b.y0 > 1.4, 'a vertical flight uses the height of the panel'],
+    ['due north', track((u) => [22 * Math.sin(u * 6), 800 * Math.sin(Math.PI * u), -3500 * u]),
+      (b) => b.x1 - b.x0 > 1.4, 'a north-going flight is seen from the side, not from behind'],
+    ['north-east', track((u) => [2400 * u, 700 * Math.sin(Math.PI * u), -2400 * u]),
+      (b) => b.x1 - b.x0 > 1.2, 'a diagonal flight too'],
+  ];
+  for (const [tname, pos, wide, why] of tracks) {
+    for (const [pname, aspect] of panels) {
+      const tan = { x: Math.tan((FOV * Math.PI) / 360) * aspect, y: Math.tan((FOV * Math.PI) / 360) };
+      const view = frameTrack(pos, tan, viewDirection(pos, ELEV), MARGIN, MAXD);
+      const cam = new THREE.PerspectiveCamera(FOV, aspect, 1, 20000);
+      cam.position.copy(view.position);
+      cam.lookAt(view.target);
+      cam.updateMatrixWorld();
+      const b = projectBox(pos, cam);
+      const inFrame = b.x0 > -1 && b.x1 < 1 && b.y0 > -1 && b.y1 < 1;
+      const centred = Math.abs((b.x0 + b.x1) / 2) < 0.06 && Math.abs((b.y0 + b.y1) / 2) < 0.06;
+      const filled = Math.max(b.x1, -b.x0, b.y1, -b.y0) > 0.62;
+      const dist = view.position.distanceTo(view.target);
+      check(
+        `framing: ${tname} on a ${pname} is whole, centred and large`,
+        inFrame && centred && filled && dist > 1 && dist <= MAXD,
+        `x[${b.x0.toFixed(2)},${b.x1.toFixed(2)}] y[${b.y0.toFixed(2)},${b.y1.toFixed(2)}] dist=${dist.toFixed(0)}`,
+      );
+      check(`framing: ${tname} on a ${pname} - ${why}`, wide(b), `w=${(b.x1 - b.x0).toFixed(2)} h=${(b.y1 - b.y0).toFixed(2)}`);
+    }
+  }
+  // the azimuth is chosen from the track, and only when the track has one
+  const east = tracks[0][1], up = tracks[1][1], north = tracks[2][1];
+  const de = viewDirection(east, ELEV), du = viewDirection(up, ELEV), dn = viewDirection(north, ELEV);
+  check('the default view looks broadside at an east-going flight', Math.abs(de.x) < 0.2 && de.z > 0.4, `dir=${de.toArray().map((v) => v.toFixed(2))}`);
+  check('and at a north-going flight from the east, so north stays away', Math.abs(dn.z) < 0.2 && dn.x > 0.4, `dir=${dn.toArray().map((v) => v.toFixed(2))}`);
+  check('a flight that comes back to the pad has no direction, and takes the old south-east azimuth', du.x > 0.4 && du.z > 0.4, `dir=${du.toArray().map((v) => v.toFixed(2))}`);
+  check('every default view is 27 degrees above the ground plane',
+    Math.abs(Math.asin(de.y) - ELEV) < 1e-9 && Math.abs(Math.asin(du.y) - ELEV) < 1e-9);
+  // a track that fills its panel has no room to be pulled back; one that does not has been resized
+  const tanWide = { x: Math.tan((FOV * Math.PI) / 360) * 3, y: Math.tan((FOV * Math.PI) / 360) };
+  const tanNarrow = { x: Math.tan((FOV * Math.PI) / 360) * 1.36, y: Math.tan((FOV * Math.PI) / 360) };
+  const fitted = frameTrack(east, tanWide, viewDirection(east, ELEV), MARGIN, MAXD);
+  check('a panel that has not changed shape asks for nothing',
+    distanceToFrame(east, tanWide, fitted.position, fitted.target) === 0);
+  const need = distanceToFrame(east, tanNarrow, fitted.position, fitted.target);
+  check('a panel that has become narrower asks to stand back', need > fitted.position.distanceTo(fitted.target) * 1.5, `need ${need.toFixed(0)}`);
+  // and nothing falls over on input that is not a flight at all
+  const point = new Float32Array([0, 0, 0]);
+  const flat = frameTrack(point, tanNarrow, viewDirection(point, ELEV), MARGIN, MAXD);
+  check('a single epoch frames without a NaN anywhere',
+    [flat.position.x, flat.position.y, flat.position.z, flat.target.x, flat.target.y, flat.target.z].every(Number.isFinite),
+    `dist=${flat.position.distanceTo(flat.target).toFixed(1)}`);
+  const dnan = new Float32Array([0, 0, 0, NaN, NaN, NaN, 500, 400, -900]);
+  const mixed = frameTrack(dnan, tanNarrow, viewDirection(dnan, ELEV), MARGIN, MAXD);
+  check('a dropped epoch in the middle of a track does not poison the framing',
+    [mixed.position.x, mixed.position.y, mixed.position.z].every(Number.isFinite));
+
+  // Follow, which is what the framed view has to survive: the airframe is kept on screen by sliding
+  // the camera sideways no further than the box requires, so that the flight already flown - which is
+  // most of what the panel is showing - stays where the framing put it.
+  const BOX = { x: 0.75, y: 0.68 };
+  for (const [tname, pos] of tracks) {
+    const aspect = 408 / 300;
+    const tan = { x: Math.tan((FOV * Math.PI) / 360) * aspect, y: Math.tan((FOV * Math.PI) / 360) };
+    const view = frameTrack(pos, tan, viewDirection(pos, ELEV), MARGIN, MAXD);
+    const cam = new THREE.PerspectiveCamera(FOV, aspect, 1, 20000);
+    cam.position.copy(view.position);
+    const target = view.target.clone();
+    cam.lookAt(target);
+    cam.updateMatrixWorld();
+    const n = pos.length / 3;
+    const p = new THREE.Vector3();
+    let spilled = 0, loose = 0, slid = 0;
+    for (let i = 0; i < n; i++) {
+      p.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+      const { look, right, up } = axesOf(cam.position.clone().sub(target).normalize());
+      const pan = panIntoFrame(p.clone().project(cam), p.clone().sub(cam.position).dot(look), tan, BOX, { right, up });
+      if (pan) {
+        cam.position.add(pan);
+        target.add(pan);
+        cam.lookAt(target);
+        cam.updateMatrixWorld();
+        slid += pan.length();
+      }
+      const now = p.clone().project(cam);
+      if (Math.abs(now.x) > BOX.x + 0.02 || Math.abs(now.y) > BOX.y + 0.02) loose++;
+      const flown = projectBox(pos, cam, i + 1);
+      if (flown.x0 < -1 || flown.x1 > 1 || flown.y0 < -1 || flown.y1 > 1) spilled++;
+    }
+    check(`follow keeps the flown part of the ${tname} flight on screen`,
+      spilled === 0 && loose === 0,
+      `${spilled} of ${n} epochs off panel, ${loose} airframe escapes, camera slid ${slid.toFixed(0)} units`);
+  }
 }
 
 console.log(fails ? `\n${fails} check(s) failed` : '\nall checks passed');
