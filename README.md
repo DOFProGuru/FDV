@@ -87,3 +87,24 @@ tools/          numerics tests, browser smoke test
 The repository is `FDV`, to sit with the others. The npm package inside it is `fdv`, because npm's rule
 for names is lowercase — enforced at publish, and by tools that check names more strictly than npm does
 locally. The capital belongs to the repository and to nothing inside it.
+
+## License
+
+MIT-0 — MIT No Attribution, `Copyright 2026 Josef Spjut`. The legal text is in [LICENSE](LICENSE) and it
+covers the code, the tools and these documents. Use it for anything, credit nobody, no notice to carry
+along and no terms to comply with: the single condition MIT imposes is the one asking a reuser to keep
+the copyright line in every copy, and MIT-0 is that clause deleted. What survives is the warranty
+disclaimer, which in a tool that prints an apogee next to an uncertainty is not a footnote — the
+output is a reconstruction of a log, and the judgement about whether to trust it stays with whoever is
+standing at the pad.
+
+Not for flight termination, range safety, or a go/no-go call. Nothing here is qualified for that.
+
+The synthetic flights under `public/data/` and the truth they are scored under are CC0 rather than MIT-0
+([LICENSE-CC0](LICENSE-CC0)), dedicated to the public domain — CC0 is the tool built for data, and a
+license written for source files is a loose fit for a CSV.
+
+Neither license grants a patent, and neither reaches what `npm install` pulls in: `three` and the rest
+stay under their own terms. Nor does either one reach the vendor's protocol: [FORMATS.md](FORMATS.md) is
+our own writing about somebody else's format, and what is licensed is our sentences, not Featherweight's
+manuals or the packets they describe.
