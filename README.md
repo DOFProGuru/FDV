@@ -81,3 +81,9 @@ public/data/    three bundled flights and their manifest
 sample/         the simulator that generated them, and the truth they are scored against
 tools/          numerics tests, browser smoke test
 ```
+
+## The name
+
+The repository is `FDV`, to sit with the others. The npm package inside it is `fdv`, because npm's rule
+for names is lowercase — enforced at publish, and by tools that check names more strictly than npm does
+locally. The capital belongs to the repository and to nothing inside it.
