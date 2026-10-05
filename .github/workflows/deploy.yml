@@ -1,0 +1,98 @@
+# One workflow: push to main and the site is the site.
+#
+# The build is uploaded as a Pages artifact and deployed by GitHub's own action rather than committed
+# to a gh-pages branch, for one reason: the three bundled flights are 30 MB of CSVs, and a branch
+# would carry a second copy of them through history forever to publish a bundle that takes a fifth of
+# a second to make. `dist/` stays ignored. The cost of the same choice is that a deploy is a workflow
+# run and not a push, so the log of what was published lives under Actions rather than in git log.
+#
+# One setting is outside this file and cannot be set from it: Settings -> Pages -> Source must be
+# "GitHub Actions". If it is ever changed back to "Deploy from a branch", the deploy step fails with
+# "Pages not enabled", which reads like a permissions problem and is not one.
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Two pushes in quick succession queue instead of racing to the same destination. Not
+# cancel-in-progress: the run in flight is already partway to publishing, and abandoning it mid-deploy
+# to prefer the newer one is how a site ends up serving a half-written bundle.
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Check and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # 24 rather than whatever a given machine is on, because "it passes" has to mean something
+          # fixed. The npm scripts run TypeScript directly (--experimental-strip-types), which needs
+          # 22.6 or newer; that is the real floor, and the tsconfig holds the rest in check by
+          # requiring erasable syntax only.
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # The checks that are deterministic. These stop the deploy: an apogee printed from a build whose
+      # numerics moved is the failure mode this whole repository is arranged to avoid, so the pipeline
+      # is scored against sample/truth/ before anything is published.
+      - run: npm run check
+      - run: npm test
+      - run: npm run verify
+
+      - run: npm run build
+
+      # The page in a real browser, against the bundle that is about to be published: WebGL up, panels
+      # filled, nothing thrown, no NaN in the DOM. tools/smoke.mjs finds the runner's own Chrome. The
+      # runner has no GPU and the test asks for the software renderer, which is the one part of this
+      # that is about the machine rather than about the code — hence continue-on-error. Delete that
+      # line to make the browser a gate instead of a report; when you do, expect the occasional rerun.
+      - name: Browser smoke test
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npx vite preview --port 4173 >/tmp/preview.log 2>&1 &
+          preview=$!
+          trap 'kill "$preview" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:4173/ >/dev/null 2>&1 && break
+            sleep 1
+          done
+          npm run smoke || {
+            echo '::group::vite preview log'
+            cat /tmp/preview.log
+            echo '::endgroup::'
+            exit 1
+          }
+
+      - name: Upload the bundle
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

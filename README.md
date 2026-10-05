@@ -20,6 +20,29 @@ Three bundled flights are in the picker — a nominal one, a two-stage one and o
 your own logs onto the window to read them instead: any Blue Raven low-rate CSV, an optional high-rate
 CSV, and a GPS log. `npm run build && npm run preview` for the production bundle.
 
+## The hosted version
+
+**<https://dofproguru.github.io/FDV/>** — the same app, no server behind it, nothing to install.
+
+Pushing to `main` publishes it. [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs
+`check`, `test` and `verify` first and refuses to publish if any of them fail, then builds and uploads
+`dist/` as a Pages artifact. The browser smoke test runs against the built bundle too, and reports
+without gating the deploy: the runner has no GPU, so its WebGL is the software renderer, which is a
+fact about the machine rather than a verdict on the code.
+
+`dist/` is built and never committed, so there is no second copy of the 30 MB of bundled CSVs sitting
+in a `gh-pages` branch. The one thing that is not in the repository is the Pages *source* setting:
+Settings → Pages → Source must read **GitHub Actions**, and if it is ever switched back to "Deploy from
+a branch" the deploy fails with "Pages not enabled", which sounds like a permissions problem and is not
+one.
+
+The base is relative (`base: './'` in [`vite.config.ts`](vite.config.ts)), which is why the bundle can
+live under `/FDV/` today and under a domain later without a rebuild that differs in any other way.
+Moving to a custom domain is then a DNS record, the field in Settings → Pages, and a `CNAME` in
+`public/` so the record survives the next deploy — not a change to the build. One consequence worth
+knowing before you share it: choosing the two-stage or tumble flight in the picker pulls a ~10 MB
+high-rate log, so the page is heavier than it looks.
+
 ## What the reconstruction does
 
 `parse → pad → time-align → register → noise → fuse → events`. The fuse is an error-state Kalman filter
@@ -72,6 +95,7 @@ apogee within 0–2 ft and the track within 35–105 ft RMS, where the inertial 
 ## Layout
 
 ```
+.github/        the Pages deploy
 src/lib/        parsers, geodesy, sync, the filter and smoother, events  (no DOM, no three.js)
 src/ui/         charts, 3-D replay, attitude reading, formatting, loading
 src/main.ts     the wiring
