@@ -27,3 +27,6 @@ dist-ssr
 # not ours to publish; the samples under public/data are synthetic and from
 # sample/generate.mjs, so those are what get checked in.
 example-data/
+
+# Scratch: how to push this to github, useful once and never again
+GITHUB.md
