@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Vendor telemetry exports dropped in for local testing. Raw device dumps,
+# not ours to publish; the samples under public/data are synthetic and from
+# sample/generate.mjs, so those are what get checked in.
+example-data/
