@@ -1,13 +1,13 @@
 # Flight reconstruction
 
-Rocket flight logs in, one defensible trajectory out — with the uncertainty and the caveats shown
-next to the result rather than filed away.
+Rocket flight logs in, one defensible trajectory out — with the uncertainty and the caveats shown next
+to the result rather than filed away.
 
-It reads [Blue Raven](FORMATS.md) flight-computer logs - the `@ LOG_LOW` / `@ LOG_HIR` telemetry the
-device actually writes, or the CSV exported from it, low-rate and high-rate - and a separate GPS
-tracker log (CSV or NMEA sentences), puts them on one clock and one frame, fuses them, and presents the
-afterwards: key numbers, four profile charts, a 3-D replay with an attitude marker, an event list, a
-list of everything that went wrong with the logs, and a panel that says how much of it to believe.
+It reads [Blue Raven](FORMATS.md) flight-computer logs (the `@ LOG_LOW` / `@ LOG_HIR` telemetry the
+device writes, or the CSV exported from it) and a separate GPS tracker log (CSV or NMEA), puts them on
+one clock and one frame, fuses them, and presents the result: key numbers, four profile charts, a 3-D
+replay with an attitude marker, an event list, everything that went wrong with the logs, and a panel
+that says how much of it to believe.
 
 ## Run it
 
@@ -22,41 +22,39 @@ CSV, and a GPS log. `npm run build && npm run preview` for the production bundle
 
 ## What the reconstruction does
 
-`parse → pad → time-align → register → noise → fuse → events`. The fuse is an error-state Kalman
-filter with an RTS smoother, solved per axis: the Blue Raven's velocity gives the *shape* at 50 Hz and
-the GPS gives absolute position and velocity. Where the two disagree, the filter is told which one to
-believe by rules taken from the hardware manual — gyro rates near the ±2000 deg/s clipping limit, tilt
-past 90° while still climbing, GPS rows with no fix or too few satellites. The seconds at the head of
-a log, when the airframe is demonstrably not moving, count as a measurement of their own: the velocity
-is pinned to zero there, which is the only place in a flight an accelerometer bias can be told apart
-from motion.
+`parse → pad → time-align → register → noise → fuse → events`. The fuse is an error-state Kalman filter
+with an RTS smoother, solved per axis: the Blue Raven's velocity gives the *shape* at 50 Hz, the GPS
+gives absolute position and velocity. Where the two disagree, rules taken from the hardware manual tell
+the filter which one to believe — gyro rates near the ±2000 deg/s clipping limit, tilt past 90° while
+still climbing, GPS rows with no fix or too few satellites. The seconds at the head of a log, when the
+airframe is demonstrably not moving, count as a measurement of their own: the velocity is pinned to zero
+there, which is the only place in a flight an accelerometer bias can be told apart from motion.
 
-The detail is in [FORMATS.md](FORMATS.md): every header alias accepted, every encoding rule, every
+The detail is in [FORMATS.md](FORMATS.md) — every header alias accepted, every encoding rule, every
 undocumented assumption, and what each check is for. It is the part worth reading.
 
 ## What is measured and what is not
 
-The app distinguishes these wherever it can, and the diagnostics panel says which is which:
+The app distinguishes these wherever it can, and the diagnostics panel says which is which.
 
-- **Clock offset** — cross-correlated, with the winning score, the runner-up and an independent
-  anchor check displayed. Below about 55% it is a guess and says so.
+- **Clock offset** — cross-correlated, with the winning score, the runner-up and an independent anchor
+  check displayed. Below about 55% it is a guess and says so.
 - **Registration** — the yaw between the tracker's frame and the pad's, fitted to vertical turns, with
   its standard error and residuals.
-- **GPS quality** — how many rows were rejected as measurements and why. A row with three satellites is
-  not a position. The same panel separates the tracker's velocity noise, measured on the pad where the
-  truth is zero, from the 9–140 ft/s the two solutions disagree by in flight — the difference is the
-  airframe's, not the tracker's, and treating the smaller number as the in-flight sigma makes the
-  apogee worse.
-- **At rest on the pad** — how long the log starts out stationary, since the velocity is pinned to zero
-  over that stretch and the accelerometer bias is estimated against it. When no such stretch exists the
-  panel says so, because then the bias has nothing to be measured against and rides through the ascent.
+- **GPS quality** — how many rows were rejected as measurements, and why. A row with three satellites is
+  not a position. The panel separates the tracker's velocity noise, measured on the pad where the truth
+  is zero, from the 9–140 ft/s the two solutions disagree by in flight; that difference belongs to the
+  airframe, not the tracker, and using the smaller number as the in-flight sigma makes apogee worse.
+- **Rest on the pad** — how long the log starts out stationary, since the bias is estimated against that
+  stretch. When no such stretch exists the panel says so: the bias then has nothing to be measured
+  against and rides through the ascent.
 - **Attitude marker** — the manual does not say what vector the quaternion's imaginary part is. Both
-  readings are tested against the independently reported tilt angle, per file, and the winner is used
-  and named in the panel with its median disagreement. When neither fits, the marker is drawn from the
-  tilt and the direction of travel and labelled nominal. Roll is shown with a parallel-transported
-  datum, because there is no yaw reference to hang it on.
-- **Track colour** — teal where the fixes and the accelerometers agree, amber where the inertial
-  solution is running alone, blue where it is GPS-only because the airframe's own idea of up has failed.
+  readings are tested per file against the independently reported tilt angle; the winner is used and
+  named in the panel with its median disagreement. When neither fits, the marker is drawn from the tilt
+  and the direction of travel and labelled nominal. Roll uses a parallel-transported datum, because
+  there is no yaw reference to hang it on.
+- **Track colour** — teal where the fixes and the accelerometers agree, amber where the inertial solution
+  runs alone, blue where it is GPS-only because the airframe's own idea of up has failed.
 
 Against the simulator's truth — which the app itself never sees — the bundled flights come out with
 apogee within 0–2 ft and the track within 35–105 ft RMS, where the inertial solution alone is
@@ -66,7 +64,7 @@ apogee within 0–2 ft and the track within 35–105 ft RMS, where the inertial 
 
 | command | what it establishes |
 | --- | --- |
-| `npm test` | the numerics on their own: eigendecomposition, the Huber fits, clock alignment, filter and smoother, parser encodings, the quaternion-reading detector, the GPS measurement gate, saturation episodes, the pad rest detection, logs with pieces missing |
+| `npm test` | the numerics on their own: eigendecomposition, the Huber fits, clock alignment, filter and smoother, parser encodings, the quaternion-reading detector, the GPS measurement gate, saturation episodes, pad rest detection, logs with pieces missing |
 | `npm run verify` | the whole pipeline against `sample/truth/`, per flight |
 | `npm run smoke` | the page in a real headless Chrome: WebGL up, panels filled, nothing thrown, no NaN in the DOM (needs `npm run build && npm run preview` first) |
 | `npm run check` | types, over the app and the tools alike |
@@ -82,29 +80,28 @@ sample/         the simulator that generated them, and the truth they are scored
 tools/          numerics tests, browser smoke test
 ```
 
-## The name
+The repository is `FDV`, to sit with the others; the npm package inside it is lowercase `fdv`, because
+npm enforces that at publish.
 
-The repository is `FDV`, to sit with the others. The npm package inside it is `fdv`, because npm's rule
-for names is lowercase — enforced at publish, and by tools that check names more strictly than npm does
-locally. The capital belongs to the repository and to nothing inside it.
+## Authorship
+
+This project was drafted by the [pi](https://pi.dev) coding agent, running `qwen3.8-flash-next` over
+Ollama, under Josef Spjut's direction. The requirements, the approach at each fork and the flight-domain
+judgement are his; the drafting, the code and the debugging were the agent's.
 
 ## License
 
-MIT-0 — MIT No Attribution, `Copyright 2026 Josef Spjut`. The legal text is in [LICENSE](LICENSE) and it
-covers the code, the tools and these documents. Use it for anything, credit nobody, no notice to carry
-along and no terms to comply with: the single condition MIT imposes is the one asking a reuser to keep
-the copyright line in every copy, and MIT-0 is that clause deleted. What survives is the warranty
-disclaimer, which in a tool that prints an apogee next to an uncertainty is not a footnote — the
+MIT-0 (MIT No Attribution), `Copyright 2026 Josef Spjut` — full text in [LICENSE](LICENSE). Use the
+code, tools and documents for anything, credit nobody, no notice to carry along. What survives is the
+warranty disclaimer, which in a tool that prints an apogee next to an uncertainty is not a footnote: the
 output is a reconstruction of a log, and the judgement about whether to trust it stays with whoever is
-standing at the pad.
+standing at the pad. **Not for flight termination, range safety, or a go/no-go call** — nothing here is
+qualified for that.
 
-Not for flight termination, range safety, or a go/no-go call. Nothing here is qualified for that.
+The synthetic flights under `public/data/` and their truth files are CC0 instead
+([LICENSE-CC0](LICENSE-CC0)), dedicated to the public domain, since CC0 is the tool built for data.
 
-The synthetic flights under `public/data/` and the truth they are scored under are CC0 rather than MIT-0
-([LICENSE-CC0](LICENSE-CC0)), dedicated to the public domain — CC0 is the tool built for data, and a
-license written for source files is a loose fit for a CSV.
-
-Neither license grants a patent, and neither reaches what `npm install` pulls in: `three` and the rest
-stay under their own terms. Nor does either one reach the vendor's protocol: [FORMATS.md](FORMATS.md) is
-our own writing about somebody else's format, and what is licensed is our sentences, not Featherweight's
-manuals or the packets they describe.
+Neither license grants a patent, neither reaches what `npm install` pulls in (`three` and the rest stay
+under their own terms), and neither reaches the vendor's protocol: [FORMATS.md](FORMATS.md) is our own
+writing about somebody else's format, so what is licensed is our sentences, not Featherweight's manuals
+or the packets they describe.
