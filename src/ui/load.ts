@@ -6,7 +6,7 @@
  * the GPS tracker's output, and the app should still say so rather than plot nonsense.
  */
 import { derivePad } from '../lib/fusion.ts';
-import { looksLikeBlueRaven, parseBlueRaven } from '../lib/parsers/blueRaven.ts';
+import { isHighRateLog, looksLikeBlueRaven, parseBlueRaven } from '../lib/parsers/blueRaven.ts';
 import { looksLikeGps, parseGps } from '../lib/parsers/gps.ts';
 import type { BrHighRow, BrLowRow, Dialect, FlightData, GpsRow } from '../lib/types.ts';
 
@@ -27,15 +27,7 @@ export type FileKind = 'br-low' | 'br-high' | 'gps' | 'unknown';
 
 export function identify(text: string): FileKind {
   if (looksLikeGps(text)) return 'gps';
-  if (looksLikeBlueRaven(text)) {
-    const head = text.slice(0, 40_000).toLowerCase();
-    if (/@\s*log_hir/.test(head)) return 'br-high';
-    if (/@\s*log_low/.test(head)) return 'br-low';
-    const line = head.split('\n').find((l) => l.includes(',')) ?? '';
-    const cols = new Set(line.split(',').map((c) => c.trim()));
-    if ([...cols].some((c) => c.startsWith('quat') || c.startsWith('gyro_'))) return 'br-high';
-    return 'br-low';
-  }
+  if (looksLikeBlueRaven(text)) return isHighRateLog(text) ? 'br-high' : 'br-low';
   return 'unknown';
 }
 

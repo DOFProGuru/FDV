@@ -279,6 +279,89 @@ function check(name: string, ok: boolean, detail = '') {
   check('a no-fix GPS row is kept but marked', gr[0].fixType === 0, 'fix 0 retained for gap accounting');
 }
 
+// --- the vendor's spreadsheet export ------------------------------------------
+// The export a supplier ships renames every column, brackets the units into the name, splits the
+// clock into a date and a time of day, writes the charge channels in volts and numbers the quaternion
+// terms without saying which is which. Headers here are copied from a real export, minus the columns
+// that nothing reads.
+{
+  const { parseBlueRaven, ferHas } = await import('../src/lib/parsers/blueRaven.ts');
+  const { parseGps } = await import('../src/lib/parsers/gps.ts');
+  const { identify } = await import('../src/ui/load.ts');
+
+  const expLow = [
+    'Year,Month,Day,Time,Flight_Time_(s),Sync,Temperature_(F),Baro_Press_(atm),Baro_Altitude_ASL_(feet),Baro_Altitude_AGL_(feet),Batt_Volts,Apo_Volts,Main_Volts,3rd_Volts,4th_Volts,Velocity_Up,Velocity_DR,Velocity_CR,Inertial_Altitude,Inertial_DR_Position,Inertial_CR_position,Tilt_Angle_(deg),Future_Angle_(deg),Roll_Angle_(deg),Rocket_FER_Hex,Liftoff,Apogee,Press_Increasing,Burnout_Coast,Apo_fired,Main_fired,3rd_fired,4th_fired,Normal_Ascent,Accel_Vel_LE_0,ECI_Vvel_le_0,Tilt Exceeded 90deg',
+    '2026,8,8,07:33:19.293,-1.90,181,86.3,0.9074,2664.2,-0.2,4.011,0.02,0.02,0.02,0.02,0.0,0.0,-1.0,0.0,0,0,0.0,0.0,0.0,600,0,0,0,0,0,0,0,0,1,1,1,0',
+    '2026,8,8,07:33:19.313,-1.88,201,86.3,0.9074,2663.6,-0.8,4.010,0.02,0.02,0.02,0.02,0.0,0.0,-1.0,0.0,0,0,0.0,0.0,0.0,600,0,0,0,0,0,0,0,0,1,1,1,0',
+    '2026,8,8,07:33:19.333,-1.86,221,86.3,0.9074,2663.1,-0.6,4.012,0.02,0.02,0.02,0.02,1.4,0.2,0.1,3.0,0,0,1.2,1.0,0.5,601,1,0,0,0,0,0,0,0,1,1,1,0',
+  ].join('\n');
+
+  check('the vendor low-rate export is identified', identify(expLow) === 'br-low', identify(expLow));
+  const xl = parseBlueRaven(expLow);
+  check('the export reads as the altimeter log it is', xl.kind === 'low' && xl.low.length === 3, `${xl.low.length} rows`);
+  check('the elapsed column wins over the clock column for the time axis',
+    Math.abs(xl.low[0].t + 1.9) < 1e-9 && Math.abs(xl.low[2].t + 1.86) < 1e-9,
+    `t=${xl.low.map((r) => r.t.toFixed(2)).join(',')}, not ${xl.low[0].t > 1e4 ? 'a time of day in hundredths' : 'a clock'}`);
+  check('the wall clock still gives the flight its date', xl.flightDate === '2026-08-08', `date=${xl.flightDate}`);
+  check('charge columns written in volts reach the app in millivolts',
+    xl.low[0].batteryMv === 4011 && xl.low[2].batteryMv === 4012, `${xl.low[0].batteryMv} mV from 4.011 V`);
+  check('a volts column that already holds millivolts is not multiplied again',
+    parseBlueRaven(expLow.replace('4.011,0.02', '4011,0.02').replace('4.010,0.02', '4010,0.02').replace('4.012,0.02', '4012,0.02')).low.every((r, i) => r.batteryMv === [4011, 4010, 4012][i]),
+    '4011 stays 4011');
+  check('bracketed units are matched by the field they bracket',
+    Math.abs(xl.low[0].baroPressureAtm - 0.9074) < 1e-9 && Math.abs(xl.low[0].baroTempF - 86.3) < 1e-9 && Math.abs(xl.low[0].altBaroAgl + 0.2) < 1e-9,
+    `${xl.low[0].baroPressureAtm} atm, ${xl.low[0].baroTempF} F, ${xl.low[0].altBaroAgl} ft AGL`);
+  check('the export velocity and position names reach the inertial fields',
+    Math.abs(xl.low[2].velUp - 1.4) < 1e-9 && Math.abs(xl.low[2].altNav - 3.0) < 1e-9 && Math.abs(xl.low[2].tilt - 1.2) < 1e-9 && Math.abs(xl.low[2].tiltFuture - 1.0) < 1e-9,
+    `up=${xl.low[2].velUp} alt=${xl.low[2].altNav} tilt=${xl.low[2].tilt}`);
+  // `600` hex is tilt-past-90 by the manual's table and normal ascent plus two zero-vertical-velocity
+  // flags by the export's own, which is what a row taken on the pad before liftoff has to mean.
+  check('named event flags outrank a hex register whose bits have moved',
+    ferHas(xl.low[0].fer, 7) && ferHas(xl.low[0].fer, 8) && !ferHas(xl.low[0].fer, 9) && !ferHas(xl.low[0].fer, 0),
+    `fer=0x${(xl.low[0].fer >>> 0).toString(16)} read as eci+accel, not tilt-90`);
+  check('and the flags still say liftoff when it lifts off', ferHas(xl.low[2].fer, 0), 'row 3 liftoff');
+
+  const expHigh = [
+    'Year,Month,Day,Time,Flight_Time_(s),Sync,Gyro_X,Gyro_Y,Gyro_Z,Accel_X,Accel_Y,Accel_Z,Quat_1,Quat_2,Quat_3,Quat_4,Aux_Volts,Current',
+    '2026,8,8,07:33:19.169,-2.024,57,0.0,0.0,0.0,0.99,0.05,0.03,1.00000,0.00000,0.00000,0.00000,0.016,0.0000',
+    '2026,8,8,07:33:19.171,-2.022,59,0.0,0.0,0.0,1.00,0.05,0.04,0.70711,0.70711,0.00000,0.00000,0.017,0.0000',
+  ].join('\n');
+  check('the vendor high-rate export is identified', identify(expHigh) === 'br-high', identify(expHigh));
+  const xh = parseBlueRaven(expHigh).high!;
+  check('the export elapsed column times the high-rate log', xh.length === 2 && Math.abs(xh[1].t + 2.022) < 1e-9, `t=${xh[1].t}`);
+  // Read the numbering backwards and the first row - the airframe sitting still - becomes one rolled
+  // half a turn about its own axis, which is the loudest wrong answer available on the pad.
+  check('a resting airframe is a resting airframe under Quat_1..4',
+    Math.abs(xh[0].quat[3] - 1) < 1e-6 && Math.abs(xh[0].quat[0]) < 1e-6,
+    `q=[${xh[0].quat.map((v) => v.toFixed(3))}]`);
+  check('the scalar term found at Quat_1 leaves the vector terms in order',
+    Math.abs(xh[1].quat[3] - Math.SQRT1_2) < 1e-5 && Math.abs(xh[1].quat[0] - Math.SQRT1_2) < 1e-5 && Math.abs(xh[1].quat[1]) < 1e-6,
+    `q=[${xh[1].quat.map((v) => v.toFixed(3))}]`);
+  check('the export accelerometer arrives in G', Math.abs(xh[1].accel[2] - 0.04) < 1e-9, `${xh[1].accel[2]} g`);
+
+  const expGps = [
+    'TRACKER,DATE,TIME,GS Lat,GS Lon,GS Alt asl,TRACKER Lat,TRACKER Lon,TRACKER Alt asl,FIX,HORZV,VERTV,HEAD,FLAGS,#TOT,>40,>32,>24',
+    'Sw Trk 0375,2026-08-08,06:43:42.313,34.49516,-116.95808,2852.4,34.49513,-116.95808,2859.8,3,0,0,161,0x60,17,1,11,2',
+    'Sw Trk 0375,2026-08-08,06:43:43.331,34.49516,-116.95808,2852.4,34.49514,-116.95809,2859.9,3,0,0,20,0x60,17,1,11,2',
+    'Sw Trk 0375,2026-08-08,06:43:44.300,34.49516,-116.95808,2852.4,           ,           ,0.0,0,0,0,20,0x00,0,0,0,0',
+  ].join('\n');
+  check('the ground station log is identified as the GPS log', identify(expGps) === 'gps', identify(expGps));
+  const xg = parseGps(expGps);
+  check('the tracker is the rocket and the ground station is not',
+    xg.rows.length === 2 && Math.abs(xg.rows[0].lat - 34.49513) < 1e-9 && Math.abs(xg.rows[0].altFt - 2859.8) < 1e-9,
+    `lat=${xg.rows[0].lat} alt=${xg.rows[0].altFt} (GS reads 34.49516 / 2852.4)`);
+  check('date and time of day make one stamp', xg.rows[0].iso === '2026-08-08T06:43:42.313Z' && xg.flightDate === '2026-08-08', `${xg.rows[0].iso}`);
+  check('the GPS time axis is relative to its own first row',
+    Math.abs(xg.rows[0].t) < 1e-9 && Math.abs(xg.rows[1].t - 1.018) < 1e-9,
+    `t=${xg.rows.map((r) => r.t.toFixed(3)).join(',')}`);
+  check('a time of day is never read as elapsed seconds', xg.rows.every((r) => r.t < 600), `t=${xg.rows[0].t}`);
+  check('the tracker\'s own velocity, heading and satellite count are read',
+    xg.rows[0].fixType === 3 && xg.rows[0].sats === 17 && xg.rows[0].heading === 161 && xg.rows[0].hvel === 0,
+    `fix ${xg.rows[0].fixType}, ${xg.rows[0].sats} sv, heading ${xg.rows[0].heading}`);
+  check('a fix whose position is blank is dropped, not plotted at (0,0)', xg.rows.length === 2 && !xg.rows.some((r) => r.lat === 0),
+    `${xg.rows.length} fixes kept of 3 rows`);
+}
+
 // --- joining the two Blue Raven logs on the sync counter ----------------------
 {
   const { syncAlignment } = await import('../src/lib/sync.ts');

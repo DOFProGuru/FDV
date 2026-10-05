@@ -1,4 +1,4 @@
-import { columnIndex, findColumn, num, parseCsv } from '../csv.ts';
+import { columnIndex, findColumn, firstNumericColumn, hasColumn, headerKeys, num, parseCsv, readClock } from '../csv.ts';
 import type { Dialect, GpsRow } from '../types.ts';
 
 export interface GpsParseResult {
@@ -12,15 +12,17 @@ export interface GpsParseResult {
 export function looksLikeGps(text: string): boolean {
   const head = text.slice(0, 4000).toLowerCase();
   if (/@\s*gps_stat|@frst_fix|\$g[png](gga|rmc|vtg)/.test(head)) return true;
-  const first = head.split('\n').find((l) => l.includes(','));
-  if (!first) return false;
-  const cols = new Set(first.split(',').map((c) => c.trim().toLowerCase()));
-  const hasLat = ['lat_deg', 'lat', 'latitude', 'latitude_deg', 'gps_lat'].some((c) => cols.has(c));
-  const hasLon = ['lon_deg', 'lon', 'lng', 'longitude', 'longitude_deg', 'gps_lon'].some((c) => cols.has(c));
-  return hasLat && hasLon;
+  const keys = new Set(headerKeys(text));
+  // The tracker's position, or a generic lat/lon. A ground-station log carries two positions, the
+  // receiver's own and the tracker's, and only one of them is the rocket: see `parseCsvGps`.
+  return hasColumn(keys, LAT_COLS) && hasColumn(keys, LON_COLS);
 }
 
 const FT_M = 3.28084;
+
+/** Position column names, most specific first: the tracker's own, then the generic ones. */
+const LAT_COLS = ['lat_deg', 'trk_lat', 'tracker_lat', 'rocket_lat', 'vehicle_lat', 'lat', 'latitude', 'latitude_deg', 'gps_lat'];
+const LON_COLS = ['lon_deg', 'trk_lon', 'tracker_lon', 'rocket_lon', 'vehicle_lon', 'lon', 'lng', 'longitude', 'longitude_deg', 'gps_lon'];
 
 /** NMEA positions are degrees + decimal minutes; split on the minute boundary. */
 function dmsToDeg(raw: number, hemi: string): number {
@@ -119,33 +121,46 @@ function parseCsvGps(text: string): { rows: GpsRow[]; flightDate?: string; warni
   const warnings: string[] = [];
 
   const cIso = col('t_iso', 'time_iso', 'utc', 'utc_time', 'timestamp', 'datetime', 'date_time', 'gps_time', 'time_utc');
+  // Date and time of day, the way a tracker log writes its clock when it has no single ISO column.
+  // `time` also appears in the elapsed list below: which of the two it is gets settled from the
+  // column's contents, since 9600.0 and 06:43:42.313 are not the same quantity under one name.
+  const cDate = col('date', 'gps_date', 'fix_date', 'date_utc');
+  const cClock = col('time', 'time_of_day', 'gps_clock', 'clock');
   const cT = col('t_s', 'time_s', 'elapsed_time_s', 'time', 'seconds', 't');
   const cTms = col('t_ms', 'time_ms', 'millis');
-  const cLat = col('lat_deg', 'lat', 'latitude', 'latitude_deg', 'gps_lat');
-  const cLon = col('lon_deg', 'lon', 'lng', 'longitude', 'longitude_deg', 'gps_lon');
-  const cAlt = col('alt_ft', 'altitude_ft', 'alt_asl_ft', 'alt', 'gps_altitude_ft', 'altitude_ft_asl');
+  const cLat = col(...LAT_COLS);
+  const cLon = col(...LON_COLS);
+  const cAlt = col('alt_asl_ft', 'alt_asl', 'tracker_alt_asl', 'trk_alt_asl', 'gps_altitude_ft_asl', 'altitude_ft_asl', 'alt_ft', 'altitude_ft', 'gps_altitude_ft', 'alt');
   const cAltM = col('alt_m', 'altitude_m', 'alt_asl_m', 'elev_m');
-  const cHvel = col('hvel_fps', 'horizontal_velocity_fps', 'ground_speed_fps', 'hvel', 'speed_fps');
+  const cHvel = col('hvel_fps', 'horizontal_velocity_fps', 'ground_speed_fps', 'hvel', 'horzv', 'horz_fps', 'gps_horz_speed_fps', 'speed_fps');
   const cHvelMs = col('hvel_mps', 'ground_speed_mps', 'speed_mps', 'horizontal_velocity_mps');
-  const cHead = col('heading_deg', 'heading', 'course_deg', 'course', 'track_deg');
-  const cUp = col('upvel_fps', 'upward_velocity_fps', 'vertical_velocity_fps', 'climb_fps', 'upvel');
+  const cHead = col('heading_deg', 'heading', 'head', 'course_deg', 'course', 'track_deg');
+  const cUp = col('upvel_fps', 'upward_velocity_fps', 'vertical_velocity_fps', 'climb_fps', 'upvel', 'vertv', 'vert_fps', 'gps_vert_speed_fps');
   const cUpMs = col('upvel_mps', 'vertical_velocity_mps', 'climb_mps');
   const cFix = col('fix_type', 'fix', 'gps_fix', 'position_type');
-  const cSats = col('sats_total', 'satellites', 'sats', 'sv_count', 'num_sv', 'sat_count');
+  const cSats = col('sats_total', 'satellites', 'sats', 'sv_count', 'num_sv', 'sat_count', 'tot');
   const cHdop = col('hdop', 'gps_hdop', 'hdop_100', 'dop');
   if (cLat < 0 || cLon < 0) warnings.push('GPS file: latitude/longitude columns not found.');
+  // A log of the ground station records where the receiver is, which is not where the rocket is. The
+  // vendor's own export names both positions and the tracker's wins; when only the station's is
+  // present, the track being drawn is the vehicle's, and that has to be said out loud rather than
+  // plotted as a rocket that never left the launcher.
+  if (col('gs_lat') >= 0 && !hasColumn(new Set(headerKeys(text)), ['trk_lat', 'tracker_lat', 'rocket_lat', 'vehicle_lat'])) {
+    warnings.push('GPS file gives the ground station its own position and no tracker position; the ground is not the rocket.');
+  }
+  const clockOf = readClock({ stamp: cIso, date: cDate, clock: cClock });
+  const cElapsed = firstNumericColumn(rows, [cT, cTms]);
 
   const out: GpsRow[] = [];
   let epochMs = NaN;
   for (const r of rows) {
     const g = (c: number) => (c >= 0 ? num(r[c]) : NaN);
-    const isoRaw = cIso >= 0 ? (r[cIso] ?? '').trim() : '';
-    let iso: string | undefined;
-    if (/[0-9]/.test(isoRaw)) {
-      const norm = (isoRaw.includes('T') ? isoRaw : isoRaw.replace(' ', 'T'));
-      iso = /Z|[+-]\d{2}:?\d{2}$/.test(norm) ? norm : norm + 'Z';
-      if (!Number.isFinite(Date.parse(iso))) iso = undefined;
-      else if (!Number.isFinite(epochMs)) epochMs = Date.parse(iso);
+    const iso = clockOf(r);
+    let stamp: string | undefined;
+    if (iso && Number.isFinite(Date.parse(iso))) {
+      stamp = iso;
+      const ms = Date.parse(iso);
+      if (!Number.isFinite(epochMs)) epochMs = ms;
     }
 
     // Metric columns are only consulted when the feet column is absent, so a file that carries
@@ -158,8 +173,8 @@ function parseCsvGps(text: string): { rows: GpsRow[]; flightDate?: string; warni
     if (!Number.isFinite(upvel)) upvel = g(cUpMs) * FT_M;
 
     out.push({
-      t: cT >= 0 ? g(cT) : cTms >= 0 ? g(cTms) / 1000 : NaN,
-      iso,
+      t: cElapsed >= 0 ? num(r[cElapsed]) / (cElapsed === cTms && cTms >= 0 ? 1000 : 1) : NaN,
+      iso: stamp,
       lat: g(cLat),
       lon: g(cLon),
       altFt: alt,
@@ -185,7 +200,7 @@ function parseCsvGps(text: string): { rows: GpsRow[]; flightDate?: string; warni
       if (!Number.isFinite(r.t)) r.t = last + 0.1;
       last = r.t;
     }
-    if (!Number.isFinite(epochMs) && cT < 0 && cTms < 0) {
+    if (!Number.isFinite(epochMs) && cElapsed < 0) {
       warnings.push('GPS file has no usable time column; assuming the documented 10 Hz cadence.');
     }
   }

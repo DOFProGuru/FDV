@@ -1,4 +1,4 @@
-import { columnIndex, findColumn, num, parseBitmask, parseCsv } from '../csv.ts';
+import { columnIndex, findColumn, firstNumericColumn, hasColumn, headerKeys, num, parseBitmask, parseCsv, readClock } from '../csv.ts';
 import type { BrHighRow, BrLowRow, Dialect } from '../types.ts';
 
 /** Flight-event register bits, from the Blue Raven manual's rocket-level event table. */
@@ -29,12 +29,23 @@ export interface BrParseResult {
 export function looksLikeBlueRaven(text: string): boolean {
   const head = text.slice(0, 4000).toLowerCase();
   if (/@\s*log_(low|hir)/.test(head)) return true;
-  const first = head.split('\n').find((l) => l.includes(','));
-  if (!first) return false;
-  const cols = first.split(',').map((c) => c.trim().toLowerCase());
-  const has = (...names: string[]) => names.some((n) => cols.includes(n));
-  return (has('vel_up_fps', 'vel_up', 'upward_velocity_fps', 'vel') && has('alt_nav_ft', 'pos_downrange_ft', 'inertial_nav_altitude_ft')) ||
-    (has('quat_x', 'quatw') && has('gyro_x_dpps', 'accel_x_g'));
+  const cols = new Set(headerKeys(text));
+  const has = (...names: string[]) => hasColumn(cols, names);
+  return (has('vel_up_fps', 'vel_up', 'upward_velocity_fps', 'vel', 'velocity_up') &&
+    has('alt_nav_ft', 'pos_downrange_ft', 'inertial_nav_altitude_ft', 'inertial_altitude')) ||
+    (has('quat_x', 'quatw', 'quat_1') && has('gyro_x_dpps', 'gyro_x'));
+}
+
+/**
+ * Whether a Blue Raven file is the 500 Hz attitude log rather than the 50 Hz altimeter log. The two
+ * share the elapsed-time and sync columns; what separates them is the inertial measurement. Exported
+ * because the loader has to make the same call as the parser, and two answers would be two bugs.
+ */
+export function isHighRateLog(text: string): boolean {
+  const head = text.slice(0, 40_000);
+  if (/@\s*log_hir/.test(head)) return true;
+  if (/@\s*log_low/.test(head)) return false;
+  return hasColumn(new Set(headerKeys(text)), ['quat_x', 'quat_1', 'quaternion_x', 'qx', 'gyro_x', 'gyro_x_dpps', 'gyro_x_degps']);
 }
 
 // --- native telemetry --------------------------------------------------------
@@ -182,46 +193,122 @@ function parseTelemetryHigh(text: string): BrHighRow[] {
 }
 
 // --- CSV ---------------------------------------------------------------------
-function parseCsvLow(text: string): { rows: BrLowRow[]; warnings: string[] } {
+/**
+ * A millivolt column, from whichever of the two forms the file carries.
+ *
+ * The telemetry writes millivolts and the vendor's spreadsheet export writes volts, and the column
+ * name is the only thing that says which. The magnitude decides rather than the name: a charge column
+ * reads 0-2 V or 0-2,000 mV and a battery 4-25 V or 4,000-25,000 mV, so no honest file sits between
+ * the two readings, and an export whose `volts` column already holds millivolts is not divided twice.
+ */
+function millivoltColumn(rows: string[][], cMv: number, cV: number): (r: string[]) => number {
+  if (cMv >= 0 && firstNumericColumn(rows, [cMv]) >= 0) return (r) => num(r[cMv]);
+  if (cV >= 0 && firstNumericColumn(rows, [cV]) >= 0) {
+    const m = sampledMedianAbs(rows, [cV]);
+    const alreadyMv = Number.isFinite(m) && m >= 100;
+    return (r) => Math.round(num(r[cV]) * (alreadyMv ? 1 : 1000));
+  }
+  return () => NaN;
+}
+
+function parseCsvLow(text: string): { rows: BrLowRow[]; flightDate?: string; warnings: string[] } {
   const { header, rows } = parseCsv(text);
   const idx = columnIndex(header);
   const col = (...a: string[]) => findColumn(idx, a);
-  const cT = col('t_s', 'time_s', 'seconds', 'time', 'elapsed_time_s', 't');
+  // `Flight_Time_(s)` is the vendor export's name for the same elapsed seconds. It comes before the
+  // bare `time`, which in both of the vendor's files is a time of day and not an interval.
+  const cT = col('t_s', 'time_s', 'Flight_Time_(s)', 'seconds', 'elapsed_time_s', 'time', 't');
   const cSync = col('sync_code', 'sync', 'ms_counter');
   const cTms = col('t_ms', 'time_ms', 'millis');
-  const cUp = col('vel_up_fps', 'vel_up', 'upward_velocity_fps', 'upward_velocity', 'velup');
-  const cDn = col('vel_downrange_fps', 'vel_downrange', 'down_range_velocity_fps', 'downrange_velocity', 'velr1');
-  const cCr = col('vel_crossrange_fps', 'vel_crossrange', 'cross_range_velocity_fps', 'crossrange_velocity', 'velr2');
-  const cAltNav = col('alt_nav_ft', 'inertial_nav_altitude_ft', 'inertial_nav_altitude', 'alt_ft', 'altitude_ft');
-  const cPosDn = col('pos_downrange_ft', 'downrange_feet', 'down_range_ft', 'downrange');
-  const cPosCr = col('pos_crossrange_ft', 'cross_range_feet', 'cross_range_ft', 'crossrange');
-  const cAltBaro = col('alt_baro_agl_ft', 'agl_ft', 'agl', 'baro_altitude_ft', 'altitude_agl_ft');
+  const cStamp = col('t_iso', 'timestamp', 'datetime', 'date_time');
+  const cYear = col('year'), cMonth = col('month'), cDay = col('day');
+  const cClock = col('time', 'clock', 'time_of_day');
+  const cUp = col('vel_up_fps', 'vel_up', 'upward_velocity_fps', 'upward_velocity', 'velup', 'Velocity_Up');
+  const cDn = col('vel_downrange_fps', 'vel_downrange', 'down_range_velocity_fps', 'downrange_velocity', 'velr1', 'Velocity_DR');
+  const cCr = col('vel_crossrange_fps', 'vel_crossrange', 'cross_range_velocity_fps', 'crossrange_velocity', 'velr2', 'Velocity_CR');
+  const cAltNav = col('alt_nav_ft', 'inertial_nav_altitude_ft', 'inertial_nav_altitude', 'Inertial_Altitude', 'alt_ft', 'altitude_ft');
+  const cPosDn = col('pos_downrange_ft', 'downrange_feet', 'down_range_ft', 'downrange', 'Inertial_DR_Position');
+  const cPosCr = col('pos_crossrange_ft', 'cross_range_feet', 'cross_range_ft', 'crossrange', 'Inertial_CR_Position');
+  const cAltBaro = col('alt_baro_agl_ft', 'agl_ft', 'agl', 'baro_altitude_ft', 'altitude_agl_ft', 'Baro_Altitude_AGL_(feet)');
+  const cBatt = col('battery_mv', 'battery_millivolts', 'battery', 'vbat');
+  const cBattV = col('Batt_Volts', 'battery_volts', 'batt_v');
+  const cApo = col('apo_mv', 'apo_millivolts', 'apogee_mv');
+  const cApoV = col('Apo_Volts', 'apo_volts', 'apogee_volts');
+  const cMain = col('main_mv', 'main_millivolts');
+  const cMainV = col('Main_Volts', 'main_volts');
+  const cThird = col('third_mv', '3rd_mv', 'ch3_mv');
+  const cThirdV = col('3rd_Volts', 'third_volts', 'ch3_volts');
+  const cFourth = col('fourth_mv', '4th_mv', 'ch4_mv');
+  const cFourthV = col('4th_Volts', 'fourth_volts', 'ch4_volts');
   const warnings: string[] = [];
   if (cUp < 0 && cAltNav < 0) warnings.push('Blue Raven file: no velocity or altitude columns recognised.');
-  // If the file carries no time column at all, assume the documented 50 Hz cadence.
-  const hasTime = cT >= 0 || cTms >= 0 || cSync >= 0;
+  // Elapsed seconds, then milliseconds, then the record's own clock, then the sync counter: whichever
+  // of them is actually carrying numbers, because `time` is a name two exports share.
+  const cSec = firstNumericColumn(rows, [cT, cTms]);
+  const clockOf = readClock({ stamp: cStamp, year: cYear, month: cMonth, day: cDay, clock: cClock });
+  const epochs = cSec < 0 && cSync < 0 ? rows.map((r) => { const iso = clockOf(r); return iso ? Date.parse(iso) : NaN; }) : [];
+  const epoch0 = epochs.find((e) => Number.isFinite(e)) ?? NaN;
+  // Two different stamps are enough to call it a clock: a file that repeats one stamp says nothing
+  // about time and had better fall back to the nominal cadence.
+  const hasClock = Number.isFinite(epoch0) && epochs.some((e) => Number.isFinite(e) && e !== epoch0);
+  const hasTime = cSec >= 0 || cSync >= 0 || hasClock;
   if (!hasTime && rows.length) warnings.push('Blue Raven file has no time column; assuming the nominal 50 Hz cadence.');
+  const mv = {
+    battery: millivoltColumn(rows, cBatt, cBattV),
+    apo: millivoltColumn(rows, cApo, cApoV),
+    main: millivoltColumn(rows, cMain, cMainV),
+    third: millivoltColumn(rows, cThird, cThirdV),
+    fourth: millivoltColumn(rows, cFourth, cFourthV),
+  };
+  const cFer = col('fer', 'flight_event_register', 'fer_rocket', 'Rocket_FER_Hex', 'event_register');
+  // The spreadsheet export decodes the event register into named columns as well as printing the
+  // hex, and the two do not agree on where the bits are: the export counts a `Burnout_Coast` flag
+  // ahead of the burn channels that the manual's table does not, which shifts every channel one
+  // place. Read by the manual's numbers, this file's first row (`600` hex) comes out as "tilt
+  // exceeded 90 degrees" where the file's own flags say vertical velocity and accel-only velocity
+  // have each fallen to zero, which on the pad before liftoff is what they do. Where the export
+  // names its flags, the named flags are the event record. The four burn channels are what the two
+  // tables disagree about, so those are what must be present before the names are trusted: a partial
+  // set of them tells less than the documented bit table does.
+  const flagCols: { bit: number; c: number }[] = [
+    { bit: 0, c: col('liftoff') },
+    { bit: 1, c: col('apogee') },
+    { bit: 2, c: col('press_increasing') },
+    { bit: 3, c: col('apo_fired') },
+    { bit: 4, c: col('main_fired') },
+    { bit: 5, c: col('3rd_fired') },
+    { bit: 6, c: col('4th_fired') },
+    { bit: 7, c: col('eci_vvel_le_0', 'eci_v_vel_le_0') },
+    { bit: 8, c: col('accel_vel_le_0', 'accel_vel_le_0') },
+    { bit: 9, c: col('tilt_exceeded_90deg', 'tilt_exceeded_90_deg', 'tilt_90') },
+  ];
+  const namedFlags = flagCols.filter((f) => f.bit >= 3 && f.bit <= 6).every((f) => f.c >= 0);
   const out: BrLowRow[] = [];
+  let flightDate: string | undefined;
   for (let rowI = 0; rowI < rows.length; rowI++) {
     const r = rows[rowI];
-    const g = (c: number) => (c >= 0 ? num(r[c]) : NaN);
-    const ferRaw = (names: string[]) => {
-      const c = col(...names);
-      return c >= 0 ? parseBitmask(r[c]) : NaN;
-    };
-    const fer = ferRaw(['fer', 'flight_event_register', 'fer_rocket', 'event_register']);
-    const t = cT >= 0 ? g(cT) : cTms >= 0 ? g(cTms) / 1000 : g(cSync) / 1000;
+    const g = (c: number, d = 1) => (c >= 0 ? num(r[c]) / d : NaN);
+    if (!flightDate) {
+      const iso = clockOf(r);
+      if (iso) flightDate = iso.slice(0, 10);
+    }
+    const fer = namedFlags
+      ? flagCols.reduce((m, f) => (f.c >= 0 && num(r[f.c]) > 0 ? m | (1 << f.bit) : m), 0)
+      : cFer >= 0
+        ? parseBitmask(r[cFer])
+        : NaN;
+    const t = cSec >= 0 ? g(cSec, cSec === cTms && cTms >= 0 ? 1000 : 1) : hasClock ? (epochs[rowI] - epoch0) / 1000 : g(cSync) / 1000;
     out.push({
       t,
       sync: g(cSync),
-      baroTempF: g(col('baro_temp_f', 'baro_temperature_f', 'baro_temp', 'temperature_f')),
-      baroPressureAtm: g(col('baro_pressure_atm', 'pressure_atm', 'baro_pressure')),
-      batteryMv: g(col('battery_mv', 'battery_millivolts', 'battery', 'vbat')),
-      apoMv: g(col('apo_mv', 'apo_millivolts', 'apogee_mv')),
-      mainMv: g(col('main_mv', 'main_millivolts')),
-      thirdMv: g(col('third_mv', '3rd_mv', 'ch3_mv')),
-      fourthMv: g(col('fourth_mv', '4th_mv', 'ch4_mv')),
-      outputMa: g(col('output_ma', 'output_current_ma', 'output_current')),
+      baroTempF: g(col('baro_temp_f', 'baro_temperature_f', 'baro_temp', 'Temperature_(F)')),
+      baroPressureAtm: g(col('baro_pressure_atm', 'pressure_atm', 'baro_pressure', 'Baro_Press_(atm)')),
+      batteryMv: mv.battery(r),
+      apoMv: mv.apo(r),
+      mainMv: mv.main(r),
+      thirdMv: mv.third(r),
+      fourthMv: mv.fourth(r),
+      outputMa: g(col('output_ma', 'output_current_ma', 'output_current', 'Current')),
       velUp: g(cUp),
       velDown: g(cDn),
       velCross: g(cCr),
@@ -229,26 +316,30 @@ function parseCsvLow(text: string): { rows: BrLowRow[]; warnings: string[] } {
       posDown: g(cPosDn),
       posCross: g(cPosCr),
       altBaroAgl: g(cAltBaro),
-      tilt: g(col('tilt_deg', 'tilt_angle_deg', 'tilt')),
-      roll: g(col('roll_deg', 'roll_angle_deg', 'roll')),
-      tiltFuture: g(col('tilt_future_deg', 'future_tilt_angle_deg', 'tilt_predicted_deg')),
+      tilt: g(col('tilt_deg', 'Tilt_Angle_(deg)', 'tilt_angle_deg', 'tilt')),
+      roll: g(col('roll_deg', 'Roll_Angle_(deg)', 'roll_angle_deg', 'roll')),
+      tiltFuture: g(col('tilt_future_deg', 'Future_Angle_(deg)', 'future_angle_deg', 'future_tilt_angle_deg', 'tilt_predicted_deg')),
       fer: Number.isFinite(fer) ? fer : 0,
       ...(hasTime ? {} : { t: rowI / 50 }),
     });
   }
-  return { rows: out.filter((r) => Number.isFinite(r.t)), warnings };
+  return { rows: out.filter((r) => Number.isFinite(r.t)), flightDate, warnings };
 }
 
 function parseCsvHigh(text: string): BrHighRow[] {
   const { header, rows } = parseCsv(text);
   const idx = columnIndex(header);
   const col = (...a: string[]) => findColumn(idx, a);
-  const cT = col('t_s', 'time_s', 'time', 't');
+  const cT = col('t_s', 'time_s', 'Flight_Time_(s)', 'time', 't');
   const cTms = col('t_ms', 'time_ms');
   const cSync = col('sync_code', 'sync');
   const cGyro = [col('gyro_x_dpps', 'gyro_x_degps', 'gyro_x'), col('gyro_y_dpps', 'gyro_y_degps', 'gyro_y'), col('gyro_z_dpps', 'gyro_z_degps', 'gyro_z')];
   const cAccel = [col('accel_x_g', 'accel_x'), col('accel_y_g', 'accel_y'), col('accel_z_g', 'accel_z')];
-  const cQuat = [col('quat_x', 'quaternion_x', 'qx'), col('quat_y', 'quaternion_y', 'qy'), col('quat_z', 'quaternion_z', 'qz'), col('quat_w', 'quat_mag', 'quaternion_magnitude', 'qw', 'quat_m')];
+  // `Quat_1..4` numbers the four terms without saying which is the scalar one; `quatOrder` decides
+  // that from the rows at rest rather than from the numbering.
+  const cQuat = [col('quat_x', 'quaternion_x', 'qx', 'Quat_1', 'quat_1'), col('quat_y', 'quaternion_y', 'qy', 'Quat_2', 'quat_2'), col('quat_z', 'quaternion_z', 'qz', 'Quat_3', 'quat_3'), col('quat_w', 'quat_mag', 'quaternion_magnitude', 'qw', 'quat_m', 'Quat_4', 'quat_4')];
+  const qAt = quatOrder(rows, cQuat, cGyro);
+  const cSec = firstNumericColumn(rows, [cT, cTms, cSync]);
   // A vendor CSV carries the telemetry's integer scalings (deg/s and G x100); a spreadsheet
   // re-export of the same file carries engineering units. Read the data, not the file name: across
   // a whole flight the median turn rate is tens of deg/s and the median specific force about 1 G,
@@ -258,17 +349,40 @@ function parseCsvHigh(text: string): BrHighRow[] {
   const out: BrHighRow[] = [];
   for (const r of rows) {
     const g = (c: number, d = 1) => (c >= 0 ? num(r[c]) / d : NaN);
-    const t = cT >= 0 ? g(cT) : cTms >= 0 ? g(cTms) / 1000 : g(cSync) / 1000;
+    const t = cSec >= 0 ? g(cSec, cSec === cTms && cTms >= 0 ? 1000 : 1) : NaN;
     if (!Number.isFinite(t)) continue;
     out.push({
       t,
       sync: g(cSync),
       gyro: cGyro.map((c) => g(c, gyroScale)) as [number, number, number],
       accel: cAccel.map((c) => g(c, accelScale)) as [number, number, number],
-      quat: quatFrom(g(cQuat[0]), g(cQuat[1]), g(cQuat[2]), g(cQuat[3])),
+      quat: quatFrom(g(qAt[0]), g(qAt[1]), g(qAt[2]), g(qAt[3])),
     });
   }
   return out;
+}
+
+/**
+ * Which column holds each quaternion term, in the internal `[x, y, z, w]` order.
+ *
+ * A header that writes `Quat_1..4` numbers the terms without saying which is `cos(theta/2)`, and the
+ * orderings are not equivalent: taken the wrong way round, an airframe sitting at rest on the pad
+ * becomes one turned 180 degrees about its own axis. The rows before liftoff settle it. At rest the
+ * attitude is the identity, in which exactly one term is +-1 and the other three are 0, and the term
+ * that is not zero is the scalar one. A log that is already turning in its first rows, or whose
+ * sensor is mounted at a fixed angle to the airframe, says nothing either way, and the documented
+ * order is what is left.
+ */
+function quatOrder(rows: string[][], cols: number[], cGyro: number[]): number[] {
+  const r = rows[0];
+  // deg/s: a resting airframe does not turn, so a log whose first sample is already turning cannot
+  // be asked which end of the quaternion is which.
+  if (!r || cGyro.some((c) => { const v = Math.abs(num(r[c])); return Number.isFinite(v) && v > 2; })) return cols;
+  const q = cols.map((c) => num(r[c]));
+  if (q.some((v) => !Number.isFinite(v))) return cols;
+  const w = q.findIndex((v, j) => Math.abs(Math.abs(v) - 1) < 0.02 && q.every((u, k) => k === j || Math.abs(u) < 0.02));
+  if (w < 0) return cols;
+  return [...cols.filter((_, j) => j !== w), cols[w]];
 }
 
 // --- scaling and attitude helpers --------------------------------------------
@@ -330,15 +444,13 @@ export function parseBlueRaven(text: string, _fileName = ''): BrParseResult {
     if (!rows.length) warnings.push('Blue Raven telemetry: found no @ LOG_LOW records.');
     return { low: rows, dialect: 'telemetry', kind: 'low', flightDate, warnings };
   }
-  const { header } = parseCsv(text);
-  const lower = header.map((h) => h.toLowerCase());
-  const isHigh = lower.some((h) => h.startsWith('quat') || h.startsWith('gyro_'));
+  const isHigh = isHighRateLog(text);
   if (isHigh) {
     const high = parseCsvHigh(text);
     if (!high.length) warnings.push('Blue Raven high-rate file parsed but contained no rows.');
     return { low: [], high, dialect: 'csv', kind: 'high', warnings };
   }
-  const { rows, warnings: w } = parseCsvLow(text);
+  const { rows, flightDate, warnings: w } = parseCsvLow(text);
   if (!rows.length) warnings.push('Blue Raven CSV parsed but contained no usable rows.');
-  return { low: rows, dialect: 'csv', kind: 'low', warnings: [...warnings, ...w] };
+  return { low: rows, dialect: 'csv', kind: 'low', flightDate, warnings: [...warnings, ...w] };
 }

@@ -125,6 +125,35 @@ TrkAlt5655 lt39.55612 ln-105.1032 Vel0 -1550 Fix3 #9 42 0 0
 Altitude is ASL; the flight computer reports AGL. The pad elevation is recovered from the GPS
 on-pad samples, which is one reason both files are needed.
 
+## The vendor's spreadsheet export
+
+Both Blue Raven logs and the tracker's feed also come out of the supplier's own tool, with different
+names on everything and the units bracketed into the name. Nothing about a file's *name* is trusted
+to say which log it is - the header is.
+
+**Blue Raven, low rate** (50 Hz, engineering units throughout):
+
+| Header | Column it stands for |
+|---|---|
+| `Year` `Month` `Day` `Time` | the wall clock: `2026, 8, 8, 07:33:19.293` |
+| `Flight_Time_(s)` | `t_s` |
+| `Sync` | `sync_code` |
+| `Temperature_(F)` `Baro_Press_(atm)` `Baro_Altitude_ASL_(feet)` `Baro_Altitude_AGL_(feet)` | `baro_temp_f` `baro_pressure_atm` — `alt_baro_asl_ft` `alt_baro_agl_ft` |
+| `Batt_Volts` `Apo_Volts` `Main_Volts` `3rd_Volts` `4th_Volts` | the charge monitor, in **volts** |
+| `Velocity_Up` `Velocity_DR` `Velocity_CR` | `vel_up_fps` `vel_downrange_fps` `vel_crossrange_fps` |
+| `Inertial_Altitude` `Inertial_DR_Position` `Inertial_CR_position` | `alt_nav_ft` `pos_downrange_ft` `pos_crossrange_ft` |
+| `Tilt_Angle_(deg)` `Roll_Angle_(deg)` `Future_Angle_(deg)` | `tilt_deg` `roll_deg` `tilt_future_deg` |
+| `Rocket_FER_Hex` `Apo_FER_Hex` | `fer` `fer_apo`, plus the same register decoded into named columns |
+
+**Blue Raven, high rate** (500 Hz): `Gyro_X/Y/Z`, `Accel_X/Y/Z` (already deg/s and g, no ×100),
+`Quat_1` … `Quat_4`, `Current`.
+
+**Ground station** (about 1 Hz): `TRACKER` (the receiver's own name, unused), `DATE` + `TIME`,
+`GS Lat` `GS Lon` `GS Alt asl` (the *ground station's* position — the van, not flown),
+`TRACKER Lat` `TRACKER Lon` `TRACKER Alt asl` (the rocket), `FIX` `HORZV` `VERTV` `HEAD` `#TOT`
+(= `fix_type` `hvel_fps` `upvel_fps` `heading_deg` `sats_total`), `FLAGS` (hex receiver state,
+unused) and `>24` `>32` `>40` (SV counts by band, unused).
+
 ## Encoding rules the parsers apply
 
 These are the places where a file can be read two different ways, and what decides it.
@@ -148,6 +177,45 @@ and it is renormalised on the way in, so a drifted or clipped estimate still poi
 Where only three quaternion-like terms are present they are read as a rotation vector
 (`axis * theta/2`) and the fourth term is reconstructed. A raw export that multiplies the terms by
 30000 is detected per row from the vector magnitude and divided back down.
+
+**A wall clock is a date, never a time axis.** A `Time` column holding `07:33:19.293` is a clock, and
+a numeric scan reads it as 73319.293, giving a twenty-hour log; a token containing a colon is
+therefore never read as a number. Where a file carries both a clock and an elapsed column, the elapsed
+column is the time axis and the clock contributes only the calendar date - which is what lets a GPS
+stamp with no date in it (`06:43:42.313`) be placed on the same day as the altimeter log. Neither ever
+supplies the offset *between* the two logs: an export tool timestamps files with whatever wall clock
+the operator's laptop had, and two clocks an hour apart are the normal case rather than the
+exception. The logs are joined by the shared sync counter and by the physics, and the clock's role is
+labelling. A file with no elapsed column (the ground station's) is timed by its own clock, rebased to
+zero at its first row, which is what the shape of its vertical velocity needs and nothing more.
+
+**A charge column is volts or millivolts according to its size.** The app works in millivolts and the
+spreadsheet export writes volts, but a header is only a name: a file whose `Batt_Volts` column reads
+`4011` is already in millivolts, and scaling that again reports a 4000 V battery. The column's own
+magnitude decides, and the answer is a whole number of millivolts.
+
+**Where the event register is decoded into columns, the columns win.** The export prints
+`Rocket_FER_Hex` and the same register decoded, and the two do not agree on where the bits are: the
+export counts a `Burnout_Coast` flag ahead of the burn channels that the manual's table does not,
+which shifts every channel one place. Read by the manual's numbers, `600` on the pad means "tilt
+exceeded 90°"; the file's own flags say the vertical velocity has reached zero, which is what it means
+there (see the note on bits 7-9 above). Names are used when all four burn channels among them are
+present, the hex table otherwise.
+
+**The rows at rest say which quaternion term is the scalar one.** A `Quat_1` … `Quat_4` header numbers
+the four terms without naming them, and the two orderings differ by a half turn about the airframe's
+own axis: read backwards, a rocket sitting still on the pad becomes one pointed at the ground. At rest
+the attitude is the identity, in which exactly one term is ±1 and the other three are zero, so the log's
+opening rows - before the gyro has anything to report - identify the scalar term and the other three
+keep their order. A log already turning when it starts, or a sensor mounted at a fixed angle to the
+airframe, gives no verdict, and the axis-first order documented above stands.
+
+**The ground station's position is not the rocket's.** This is the one place where a file offers two
+plausible columns for one quantity, and taking the van's position plots a flight that never leaves the
+launch site, which registers as a perfect fit and drifts nothing. The tracker's pair wins wherever both
+exist; a file with a ground-station position and no tracker position is reported
+(`the ground is not the rocket`) rather than plotted, because a trajectory that stays beside the van is
+a wrong answer, not a degenerate flight.
 
 ## Assumptions
 
@@ -239,6 +307,12 @@ Things the manuals do **not** pin down, stated so they can be corrected against 
 | `npm test` | the numerics in isolation: eigendecomposition, the Huber fits, clock alignment, the filter and smoother, the parser encoding rules, the GPS measurement gate, the quaternion-convention detector, the saturation episode merger, the pad rest detection, and the degraded input paths |
 | `npm run verify -- f17-nominal` | the whole pipeline against the simulator's truth, which the app never reads: apogee, clock offset, position and velocity RMS against truth |
 | `npm run smoke` | the page in a real headless Chrome over the DevTools protocol: WebGL came up, the panels filled in, nothing threw, no NaN reached the DOM |
+| `node --experimental-strip-types tools/dbg-load.ts logs/*.csv` | the "Open logs…" path outside a browser: which kind each file was judged to be, what came out of it, which files the bundler took and which it refused, and what the fusion made of what survived |
+
+`tools/dbg-load.ts` asserts nothing and cannot go red; it exists to be read, and it is how a set of
+files the app refuses gets argued about without a browser open. `verify.mjs` starts from the
+simulator's truth and `smoke.mjs` from the bundled flights, which is precisely what a file nobody
+has seen before is not.
 
 `sample/verify.mjs` on the three bundled flights currently reconstructs apogee to within 0–2 ft,
 the GPS clock offset to within 12 ms, and the track to 35–105 ft RMS against truth, where the
