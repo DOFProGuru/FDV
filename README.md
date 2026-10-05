@@ -22,7 +22,8 @@ CSV, and a GPS log. `npm run build && npm run preview` for the production bundle
 
 ## The hosted version
 
-**<https://dofproguru.github.io/FDV/>** — the same app, no server behind it, nothing to install.
+**<https://dofpro.org/FDV/>** — the same app, no server behind it, nothing to install.
+(<https://dofproguru.github.io/FDV/> arrives at the same page by one redirect.)
 
 Pushing to `main` publishes it. [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs
 `check`, `test` and `verify` first and refuses to publish if any of them fail, then builds and uploads
@@ -37,11 +38,12 @@ a branch" the deploy fails with "Pages not enabled", which sounds like a permiss
 one.
 
 The base is relative (`base: './'` in [`vite.config.ts`](vite.config.ts)), which is why the bundle can
-live under `/FDV/` today and under a domain later without a rebuild that differs in any other way.
-Moving to a custom domain is then a DNS record, the field in Settings → Pages, and a `CNAME` in
-`public/` so the record survives the next deploy — not a change to the build. One consequence worth
-knowing before you share it: choosing the two-stage or tumble flight in the picker pulls a ~10 MB
-high-rate log, so the page is heavier than it looks.
+live under `/FDV/` on the github.io host and under a domain root later without a rebuild that differs
+in any other way. Nothing in this repository names the hostname, so moving the site is a DNS record
+and a field in Settings → Pages; if the domain should travel with the repo rather than with the
+account, that is one `CNAME` file in `public/` and nothing else. One consequence worth knowing before
+you share it: choosing the two-stage or tumble flight in the picker pulls a ~10 MB high-rate log, so
+the page is heavier than it looks.
 
 ## What the reconstruction does
 
